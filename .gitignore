@@ -1,0 +1,31 @@
+# данные и модели
+/data/audio/*
+/data/logs/*
+!/data/audio/.gitkeep
+!/data/logs/.gitkeep
+/models/*
+!/models/.gitkeep
+/certs/*
+!/certs/.gitkeep
+
+# тестовое аудио в корне проекта: держать 60 МБ подкастов в истории
+# репозитория незачем, а нужны они только для ручных проверок
+/*.mp3
+/*.wav
+/*.m4a
+/*.tar
+
+# окружение
+.env
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# node
+node_modules/
+dist/

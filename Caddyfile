@@ -1,0 +1,55 @@
+{
+	# Оффлайн-сеть: никакого ACME/Let's Encrypt.
+	auto_https disable_redirects
+	admin off
+	log {
+		output stderr
+		level {$LOG_LEVEL:INFO}
+	}
+}
+
+# HTTP → HTTPS. Микрофон по http работать не будет в любом случае,
+# поэтому просто уводим на https.
+:80 {
+	redir https://{$LAN_HOST:scribe.local}{uri} permanent
+}
+
+:443 {
+	# Сертификат от локального CA (mkcert). Создаётся scripts/setup_tls.ps1.
+	# Корневой CA нужно поставить на клиентские машины, иначе Chrome
+	# не даст доступ к микрофону.
+	tls /certs/lan.pem /certs/lan-key.pem
+
+	encode zstd gzip
+
+	# Загрузка длинных записей
+	request_body {
+		max_size 5GB
+	}
+
+	# WebSocket живого режима
+	handle /ws/live* {
+		reverse_proxy worker-live:8001
+	}
+
+	# Служебные ручки воркеров наружу не выставляем: они ходят
+	# к backend по внутренней сети docker.
+	handle /api/internal/* {
+		respond "Not found" 404
+	}
+
+	# REST + SSE. flush_interval -1 отключает буферизацию,
+	# иначе события прогресса приезжают пачкой в конце.
+	handle /api/* {
+		reverse_proxy backend:8000 {
+			flush_interval -1
+		}
+	}
+
+	# SPA: статика, всё неизвестное — на index.html
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

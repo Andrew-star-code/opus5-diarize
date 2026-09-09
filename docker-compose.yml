@@ -1,0 +1,139 @@
+# Локальный сервис транскрипции и диаризации.
+#   docker compose up -d --build
+#
+# Три Python-сервиса разделены намеренно: тяжёлые ML-зависимости
+# (SimulStreaming, diart, faster-whisper, разные сборки torch) конфликтуют
+# между собой — отдельные образы решают это без ручной эквилибристики.
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+x-models: &models
+  # Веса моделей. Скачиваются один раз через scripts/prefetch_models.py,
+  # дальше HF_HUB_OFFLINE=1 и сеть не нужна вообще.
+  type: bind
+  source: ./models
+  target: /models
+
+services:
+  # ─────────────────────────────────────────────────────────────
+  # Caddy: TLS-терминация + статика фронтенда + реверс-прокси.
+  # HTTPS здесь обязателен, а не «для красоты»: getUserMedia()
+  # работает только в secure context, по http://192.168.x.x
+  # браузер микрофон не отдаст.
+  # ─────────────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: scribe-web:local
+    restart: unless-stopped
+    ports:
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      LAN_HOST: ${LAN_HOST:-scribe.local}
+    depends_on:
+      - backend
+      - worker-live
+    networks: [scribe]
+
+  # ─────────────────────────────────────────────────────────────
+  # Backend: единственный владелец БД. Воркеры ходят к нему по HTTP,
+  # поэтому конкурентной записи в SQLite из разных контейнеров нет.
+  # ─────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+    image: scribe-backend:local
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      DB_PATH: /db/scribe.db
+      DATA_DIR: /data
+    volumes:
+      # БД — в именованном томе (ext4 внутри WSL2), а не в bind-mount на E:\.
+      # SQLite поверх virtiofs/9p на Windows периодически ловит disk I/O error.
+      - dbdata:/db
+      - ./data:/data
+    networks: [scribe]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ─────────────────────────────────────────────────────────────
+  # Batch-воркер: эталонное качество. Одно задание за раз (VRAM 12 ГБ).
+  # ─────────────────────────────────────────────────────────────
+  worker-batch:
+    build:
+      context: ./worker-batch
+    image: scribe-worker-batch:local
+    restart: unless-stopped
+    <<: *gpu
+    env_file: [.env]
+    environment:
+      BACKEND_URL: http://backend:8000
+      DATA_DIR: /data
+      HF_HOME: /models
+      # pyannote держит свой кеш отдельно от HF и по умолчанию кладёт его
+      # в домашний каталог — то есть внутрь контейнера, где он пропадает
+      # при пересоздании, а в оффлайне модели просто не находятся.
+      # Направляем в тот же том, куда пишет скрипт предзагрузки.
+      PYANNOTE_CACHE: /models/hub
+    volumes:
+      - ./data:/data
+      - *models
+    depends_on:
+      backend:
+        condition: service_started
+    networks: [scribe]
+
+  # ─────────────────────────────────────────────────────────────
+  # Live-воркер: WebSocket /ws/live, стриминговый ASR + диаризация.
+  # ─────────────────────────────────────────────────────────────
+  worker-live:
+    build:
+      context: ./worker-live
+    image: scribe-worker-live:local
+    restart: unless-stopped
+    <<: *gpu
+    env_file: [.env]
+    environment:
+      BACKEND_URL: http://backend:8000
+      DATA_DIR: /data
+      HF_HOME: /models
+      # pyannote держит свой кеш отдельно от HF и по умолчанию кладёт его
+      # в домашний каталог — то есть внутрь контейнера, где он пропадает
+      # при пересоздании, а в оффлайне модели просто не находятся.
+      # Направляем в тот же том, куда пишет скрипт предзагрузки.
+      PYANNOTE_CACHE: /models/hub
+    volumes:
+      - ./data:/data
+      - *models
+    depends_on:
+      backend:
+        condition: service_started
+    networks: [scribe]
+
+networks:
+  scribe:
+    driver: bridge
+
+volumes:
+  dbdata:
+  caddy_data:
+  caddy_config:

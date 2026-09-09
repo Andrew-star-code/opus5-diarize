@@ -1,0 +1,292 @@
+/* ───────────────────────────────────────────────────────────────
+   Scribe — визуальная система
+
+   Одно правило держит весь интерфейс: насыщенный цвет принадлежит
+   говорящим и только им. Хром приложения — графит и бумага, а
+   единственная неспикерская краска — сигнальный красный, который
+   означает ровно одно: идёт запись. Поэтому цветное пятно на экране
+   всегда что-то значит.
+
+   Три гарнитуры на три роли:
+     Golos Text  — интерфейс (русская гротеска, к русскому продукту)
+     Literata    — тело транскрипта (это в первую очередь чтение)
+     IBM Plex Mono — данные: таймкоды, имена в репликах, счётчики
+   Шрифты приезжают из npm и лежат в сборке: сеть в оффлайне недоступна.
+   ─────────────────────────────────────────────────────────────── */
+
+@import "tailwindcss";
+
+@import "@fontsource-variable/golos-text";
+@import "@fontsource-variable/literata";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+@theme {
+  --color-paper: #e9ebec;
+  --color-card: #f7f8f8;
+  --color-sunk: #dfe2e4;
+  --color-rule: #d2d6d8;
+  --color-ink: #14171a;
+  --color-graphite: #565e64;
+  --color-mist: #8b9499;
+  --color-signal: #cf3a24;
+
+  --font-ui: "Golos Text Variable", "Golos Text", "Segoe UI", system-ui, sans-serif;
+  --font-read: "Literata Variable", Literata, Georgia, "Times New Roman", serif;
+  --font-data: "IBM Plex Mono", "Cascadia Mono", Consolas, monospace;
+
+  --radius-panel: 10px;
+
+  --ease-out: cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+/* Тёмная тема: та же система, перевёрнутая. Ленту говорящих и
+   сигнальный красный не трогаем — они должны читаться одинаково. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-paper: #16191b;
+    --color-card: #1f2325;
+    --color-sunk: #101314;
+    --color-rule: #313739;
+    --color-ink: #eceff0;
+    --color-graphite: #a6aeb2;
+    --color-mist: #737d82;
+    --color-signal: #ef5237;
+  }
+}
+
+@layer base {
+  * {
+    min-width: 0;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-ui);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Видимый фокус обязателен: редактор транскрипта реально ходят
+     клавиатурой — пробел, стрелки, Tab между репликами. */
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-ink) 18%, transparent);
+  }
+
+  button {
+    font: inherit;
+    color: inherit;
+  }
+
+  input,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+}
+
+@layer components {
+  /* ── Служебная типографика ─────────────────────────────────── */
+
+  .data {
+    font-family: var(--font-data);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+
+  .eyebrow {
+    font-family: var(--font-data);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--color-mist);
+  }
+
+  /* ── Кнопки ────────────────────────────────────────────────── */
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    height: 36px;
+    padding: 0 14px;
+    border: 1px solid var(--color-rule);
+    border-radius: 8px;
+    background: var(--color-card);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 120ms var(--ease-out), border-color 120ms var(--ease-out);
+  }
+
+  .btn:hover:not(:disabled) {
+    border-color: var(--color-mist);
+  }
+
+  .btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .btn-solid {
+    background: var(--color-ink);
+    border-color: var(--color-ink);
+    color: var(--color-paper);
+  }
+
+  .btn-solid:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--color-ink) 85%, var(--color-paper));
+    border-color: color-mix(in srgb, var(--color-ink) 85%, var(--color-paper));
+  }
+
+  .btn-signal {
+    background: var(--color-signal);
+    border-color: var(--color-signal);
+    color: #fff;
+  }
+
+  .btn-ghost {
+    background: transparent;
+    border-color: transparent;
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--color-sunk);
+    border-color: transparent;
+  }
+
+  /* ── Поверхности ───────────────────────────────────────────── */
+
+  .panel {
+    background: var(--color-card);
+    border: 1px solid var(--color-rule);
+    border-radius: var(--radius-panel);
+  }
+
+  .field {
+    height: 36px;
+    padding: 0 12px;
+    background: var(--color-card);
+    border: 1px solid var(--color-rule);
+    border-radius: 8px;
+    font-size: 14px;
+  }
+
+  /* ── Реплика транскрипта ───────────────────────────────────── */
+
+  /* Имя говорящего набрано как слаглайн в сценарии: моноширинный
+     капитель над репликой. Так устроены расшифровки на бумаге, и так
+     глаз находит смену говорящего, не читая текст. */
+  .slug {
+    font-family: var(--font-data);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  .speech {
+    font-family: var(--font-read);
+    font-size: 16.5px;
+    line-height: 1.68;
+  }
+
+  /* Ещё не устоявшаяся гипотеза движка. Показываем её приглушённой:
+     честнее, чем выдавать текст, который через секунду перепишется. */
+  .speech-draft {
+    color: var(--color-mist);
+    font-style: italic;
+  }
+
+  .word {
+    border-radius: 3px;
+    padding: 0 1px;
+    cursor: pointer;
+    transition: background 90ms linear;
+  }
+
+  .word:hover {
+    background: var(--color-sunk);
+  }
+
+  .word-active {
+    background: color-mix(in srgb, var(--color-ink) 14%, transparent);
+  }
+
+  .hit {
+    background: color-mix(in srgb, var(--color-signal) 26%, transparent);
+    border-radius: 3px;
+  }
+
+  /* ── Индикатор записи ──────────────────────────────────────── */
+
+  .rec-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--color-signal);
+    animation: rec-pulse 1.6s var(--ease-out) infinite;
+  }
+
+  @keyframes rec-pulse {
+    0%,
+    100% {
+      opacity: 1;
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-signal) 45%, transparent);
+    }
+    60% {
+      opacity: 0.75;
+      box-shadow: 0 0 0 7px transparent;
+    }
+  }
+
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      var(--color-sunk) 0%,
+      var(--color-rule) 50%,
+      var(--color-sunk) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s linear infinite;
+  }
+
+  @keyframes shimmer {
+    to {
+      background-position: -200% 0;
+    }
+  }
+}
+
+/* Клавиатура и скринридеры важнее эффектов. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Полосы прокрутки в тон панели, иначе они светят системным белым
+   поверх тёмной темы. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-rule) transparent;
+}

@@ -1,0 +1,11 @@
+# ctranslate2 >= 4.6 — в более ранних сборках int8-ядра падают
+# на sm_120 (CUBLAS_STATUS_NOT_SUPPORTED). Мы всё равно считаем во float16,
+# но свежая сборка нужна и ради поддержки самой архитектуры.
+ctranslate2>=4.6
+faster-whisper>=1.1
+pyannote.audio>=4.0,<5.0
+soundfile>=0.12
+numpy>=1.26,<3
+httpx>=0.27,<1.0
+pydantic>=2.7,<3.0
+pydantic-settings>=2.4,<3.0

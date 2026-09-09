@@ -1,0 +1,12 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+sqlmodel>=0.0.22,<0.1
+pydantic-settings>=2.4,<3.0
+python-multipart>=0.0.9
+python-docx>=1.1,<2.0
+aiofiles>=24.1
+
+# Нужен starlette.TestClient, на котором держатся сквозные тесты
+# из tests/test_backend.py. Сам сервис ходит по HTTP только исходящими
+# запросами воркеров, поэтому вес библиотеки тут не проблема.
+httpx>=0.27,<1.0
