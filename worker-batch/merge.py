@@ -6,6 +6,7 @@ ASR знает, *что* сказано и когда; диаризация — 
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 # Пауза, после которой начинаем новую реплику даже у того же говорящего
@@ -85,8 +86,14 @@ def _overlap(a1: float, a2: float, b1: float, b2: float) -> float:
     return max(0.0, min(a2, b2) - max(a1, b1))
 
 
-def assign_speakers(words: list[Word], turns: list[Turn]) -> list[str | None]:
-    """Каждому слову — говорящий с максимальным перекрытием по времени."""
+def assign_speakers(
+    words: list[Word], turns: list[Turn], *, smooth: bool = False
+) -> list[str | None]:
+    """Каждому слову — говорящий с максимальным перекрытием по времени.
+
+    smooth включает сглаживание коротких вставок (_smooth). По умолчанию
+    выключено по результатам замера — см. пояснение у _smooth.
+    """
     if not turns:
         return [None] * len(words)
 
@@ -126,22 +133,31 @@ def assign_speakers(words: list[Word], turns: list[Turn]) -> list[str | None]:
         else:
             result.append(None)
 
-    _smooth(words, result)
+    if smooth:
+        _smooth(words, result)
     return result
 
 
 def _smooth(words: list[Word], labels: list[str | None]) -> None:
     """Убирает слишком короткие вставки чужого говорящего.
 
-    Диаризация регулярно рвёт фразу посередине: на реальной записи
-    получалось «Вы хотите / сберечь планету, / но противитесь эволюции»,
-    где куски одной фразы приписаны разным людям. Настоящая реплика
-    короче полусекунды почти не встречается — за такое время не сказать
-    и слова, — так что короткие пробежки считаем артефактом.
+    ВЫКЛЮЧЕНО по умолчанию (assign_speakers(smooth=False)), и это решение
+    по замеру, а не по вкусу. На трёх встречах корпуса AMI с эталонной
+    разметкой сглаживание увеличило долю слов с неверным говорящим с
+    2,20% до 2,48% и оказалось хуже на каждой из трёх записей — причём
+    обе его части, и порог длительности, и правило «бутерброда». На
+    совещаниях короткие вставки вроде «угу» и «да» — настоящие реплики,
+    а правило их поглощает.
 
-    Если соседи по обе стороны согласны, отдаём вставку им. Если не
-    согласны, отдаём той стороне, которая говорила дольше: она вероятнее
-    и есть хозяин фразы.
+    Функция оставлена для записей, где один голос заведомо режется на
+    части. Но и там лучше помогает слияние лишних говорящих
+    (tiny_speaker_renames): оно чинит причину, а не последствия.
+
+    Как работает. Диаризация иногда рвёт фразу посередине: на реальной
+    записи получалось «Вы хотите / сберечь планету, / но противитесь
+    эволюции», где куски одной фразы приписаны разным людям. Короткие
+    пробежки считаем артефактом. Если соседи по обе стороны согласны,
+    отдаём вставку им; если нет — той стороне, что говорила дольше.
     """
     if not labels:
         return
@@ -258,3 +274,75 @@ def segments_from_asr_only(
                 best_overlap, best_label = ov, turn.label
         seg.speaker = best_label
     return asr_segments
+
+
+def tiny_speaker_renames(
+    labels: list[str],
+    durations: list[float],
+    embeddings: list[list[float]],
+    *,
+    max_share: float,
+    min_similarity: float,
+) -> dict[str, str]:
+    """Кого из найденных говорящих слить с другим, и с кем.
+
+    Диаризация иногда выделяет в отдельного человека обрывок чужого
+    голоса. На встрече ES2004a корпуса AMI модель нашла пятерых вместо
+    четырёх: лишний говорил 6,5 секунды за всю встречу, меньше 1% речи,
+    а голосом был ближе всех к одному из настоящих участников (косинусное
+    сходство эмбеддингов 0,42 при не больше 0,24 между разными людьми).
+    В интерфейсе это выглядит как «Спикер 5» с парой случайных реплик.
+
+    Правило: говорящий с долей речи меньше max_share сливается с тем,
+    на кого больше всего похож голосом, если сходство не ниже
+    min_similarity. Оба условия нужны вместе: доля отсекает настоящих
+    участников, сходство — тех, кто просто мало говорил.
+
+    Пороги строгие намеренно. На той же проверке мягкий вариант (5% и
+    0,30) склеил четверых настоящих людей в двоих. Ошибиться в сторону
+    «остался лишний обрывок» безопаснее: его реплики переназначаются в
+    редакторе, а двоих склеенных людей обратно не расклеить.
+
+    Работает на чистом Python без numpy: говорящих единицы, эмбеддинги
+    размером в сотни чисел, а модуль остаётся тестируемым где угодно.
+    """
+    n = len(labels)
+    if n < 2 or len(durations) != n or len(embeddings) != n or max_share <= 0:
+        return {}
+
+    norms = [math.sqrt(sum(x * x for x in row)) for row in embeddings]
+
+    def similarity(i: int, j: int) -> float:
+        # NaN в эмбеддинге (так бывает у говорящего почти без речи)
+        # даёт NaN в сходстве, а сравнение с NaN всегда ложно — такой
+        # говорящий просто не сольётся.
+        if not norms[i] or not norms[j]:
+            return -1.0
+        dot = sum(a * b for a, b in zip(embeddings[i], embeddings[j]))
+        return dot / (norms[i] * norms[j])
+
+    total = sum(durations) or 1.0
+    renames: dict[str, str] = {}
+    # Начинаем с самых маленьких: их сливаем в первую очередь.
+    for i in sorted(range(n), key=lambda k: durations[k]):
+        if durations[i] / total >= max_share:
+            continue
+        targets = [j for j in range(n) if j != i and labels[j] not in renames]
+        if not targets:
+            continue
+        j = max(targets, key=lambda k: similarity(i, k))
+        if similarity(i, j) >= min_similarity:
+            renames[labels[i]] = labels[j]
+
+    # Цепочки вида A→B, B→C сворачиваем в A→C, B→C: иначе у A
+    # останется метка B, которой в итоге уже нет.
+    resolved: dict[str, str] = {}
+    for source in renames:
+        target = renames[source]
+        seen = {source}
+        while target in renames and target not in seen:
+            seen.add(target)
+            target = renames[target]
+        if target != source:
+            resolved[source] = target
+    return resolved

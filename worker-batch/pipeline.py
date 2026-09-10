@@ -68,7 +68,9 @@ def process(job: dict[str, Any], report: Callable[[str, float], None]) -> dict[s
         merge_progress = _scaled(report, "merge")
         merge_progress(0.0)
         if words:
-            labels = merge.assign_speakers(words, turns)
+            labels = merge.assign_speakers(
+                words, turns, smooth=settings.smooth_speaker_turns
+            )
             segments = merge.build_segments(words, labels)
         else:
             # Пословных таймингов нет — размечаем целыми фразами.

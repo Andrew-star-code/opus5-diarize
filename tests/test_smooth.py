@@ -58,7 +58,7 @@ turns = [merge.Turn(0.0, 2.0, "A"), merge.Turn(2.05, 2.3, "B"), merge.Turn(2.35,
 words4 = [w("один", 0.2, 0.8), w("два", 1.0, 1.8),
           w("три", 2.1, 2.25),
           w("четыре", 2.5, 3.2), w("пять", 3.4, 4.2)]
-labels4 = merge.assign_speakers(words4, turns)
+labels4 = merge.assign_speakers(words4, turns, smooth=True)
 check("короткий турн B поглощён", set(labels4) == {"A"}, labels4)
 
 segments = merge.build_segments(words4, labels4)

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from config import settings
-from merge import Turn
+from merge import Turn, tiny_speaker_renames
 
 log = logging.getLogger(__name__)
 
@@ -107,9 +107,11 @@ def _annotation(output):
     pyannote 4.x возвращает DiarizeOutput с двумя вариантами разметки,
     3.x — сразу Annotation. Берём exclusive-вариант: в нём на каждый
     момент времени приходится ровно один говорящий, а нам и нужно
-    приписать каждому слову одного автора. Обычная разметка допускает
-    перекрытия, и на них слово досталось бы тому, чей отрезок просто
-    оказался длиннее.
+    приписать каждому слову одного автора.
+
+    Обычная разметка с наложениями проверялась как альтернатива на трёх
+    встречах AMI: в среднем путаница на словах чуть ниже (2,16% против
+    2,20%), но на двух записях из трёх — выше. Это шум, а не выигрыш.
     """
     for field in ("exclusive_speaker_diarization", "speaker_diarization"):
         annotation = getattr(output, field, None)
@@ -121,6 +123,32 @@ def _annotation(output):
         f"Не понимаю результат диаризации: {type(output).__name__}. "
         "Проверьте совместимость версии pyannote.audio."
     )
+
+
+def _tiny_speaker_renames(output) -> dict[str, str]:
+    """Кого из найденных говорящих слить с другим — см. merge.tiny_speaker_renames.
+
+    Эмбеддинги идут в порядке меток обычной, а не эксклюзивной разметки:
+    в эксклюзивной может не оказаться говорящего, который звучал только
+    в наложениях, и тогда индексы разъехались бы.
+    """
+    regular = getattr(output, "speaker_diarization", None)
+    embeddings = getattr(output, "speaker_embeddings", None)
+    if regular is None or embeddings is None:
+        return {}  # pyannote 3.x эмбеддингов не отдаёт
+    labels = regular.labels()
+    if len(labels) != len(embeddings):
+        return {}
+    renames = tiny_speaker_renames(
+        [str(label) for label in labels],
+        [regular.label_duration(label) for label in labels],
+        [[float(x) for x in row] for row in embeddings],
+        max_share=settings.tiny_speaker_max_share,
+        min_similarity=settings.tiny_speaker_min_similarity,
+    )
+    if renames:
+        log.info("Слиты лишние говорящие: %s", renames)
+    return renames
 
 
 def diarize(
@@ -145,8 +173,16 @@ def diarize(
     with hook:
         output = pipeline(audio, hook=hook, **kwargs)
 
+    # Число задано человеком — модель уже в него уложилась, и сливать
+    # кого-то поверх значило бы спорить с его указанием.
+    renames = {} if kwargs.get("num_speakers") else _tiny_speaker_renames(output)
+
     turns = [
-        Turn(start=float(segment.start), end=float(segment.end), label=str(label))
+        Turn(
+            start=float(segment.start),
+            end=float(segment.end),
+            label=renames.get(str(label), str(label)),
+        )
         for segment, _track, label in _annotation(output).itertracks(yield_label=True)
     ]
     turns.sort(key=lambda t: t.start)
