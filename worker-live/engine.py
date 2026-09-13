@@ -12,6 +12,7 @@ import os
 import re
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any
 
 from config import settings
@@ -170,9 +171,146 @@ class _SharedDiartModels:
             embedding=self.embedding,
             # У diart по умолчанию 20 — берём тот же предел, что у batch.
             max_speakers=settings.max_speakers,
+            # Подобраны замером, см. комментарии в config.py.
+            latency=settings.live_diar_latency,
+            tau_active=settings.live_diar_tau_active,
+            rho_update=settings.live_diar_rho_update,
+            delta_new=settings.live_diar_delta_new,
             device=self.device,
             sample_rate=self.sample_rate,
         )
+
+
+class _SegmentsObserver:
+    """Собирает разметку diart в сегменты для выравнивания WhisperLiveKit.
+
+    Замена DiarizationObserver из WhisperLiveKit, у которого два изъяна:
+
+    - границы реплик он берёт из плоского списка попарно, так что пауза
+      между двумя кусками речи одного говорящего тоже засчитывается ему;
+    - сегменты складываются по говорящим, а не по времени, а выравнивание
+      идёт по ним курсором, который считает список упорядоченным, — и на
+      смене говорящих может проскочить нужный сегмент.
+
+    Здесь сегменты идут строго по времени, а соседние куски одного
+    говорящего склеиваются. Заодно список остаётся коротким — по сегменту
+    на реплику, а не на каждые полсекунды, — и его копирование на каждом
+    обновлении не дорожает к концу долгой записи.
+    """
+
+    _GAP = 0.05  # щель между шагами diart, которую не считаем паузой
+
+    def __init__(self) -> None:
+        from whisperlivekit.timed_objects import SpeakerSegment
+
+        self._segment_cls = SpeakerSegment
+        self._segments: list = []
+        self._lock = threading.Lock()
+        self.global_time_offset = 0.0
+        self.processed_time = 0.0
+
+    def on_next(self, value) -> None:
+        annotation, audio = value
+        tracks = sorted(annotation.itertracks(yield_label=True), key=lambda item: item[0].start)
+        with self._lock:
+            self.processed_time = max(self.processed_time, audio.extent.end)
+            for segment, _track, label in tracks:
+                speaker = _speaker_index(label)
+                start = segment.start + self.global_time_offset
+                end = segment.end + self.global_time_offset
+                last = self._segments[-1] if self._segments else None
+                if last is not None and last.speaker == speaker and start <= last.end + self._GAP:
+                    last.end = max(last.end, end)
+                else:
+                    self._segments.append(self._segment_cls(start=start, end=end, speaker=speaker))
+
+    def on_error(self, error) -> None:
+        log.error("Ошибка в потоке diart: %s", error)
+
+    def on_completed(self) -> None:
+        pass
+
+    def get_segments(self) -> list:
+        # Копии: последний сегмент ещё растёт в потоке diart.
+        with self._lock:
+            return [replace(segment) for segment in self._segments]
+
+
+def _speaker_index(label: Any) -> int:
+    """«speaker3» от diart -> 3; выравнивание WhisperLiveKit ждёт число."""
+    if isinstance(label, int):
+        return label
+    digits = re.sub(r"\D", "", str(label))
+    return int(digits) if digits else 0
+
+
+_REALTIME_SOURCE = None
+
+
+def _realtime_source_class():
+    """Источник звука для diart без искусственного торможения.
+
+    WebSocketAudioSource из WhisperLiveKit перед каждым блоком досыпает до
+    длительности блока, отсчитывая время от конца обработки предыдущего.
+    Выходит, что на каждый шаг diart уходит время звука плюс время работы
+    моделей, и разметка отстаёт всё сильнее: по замеру на 5,5 с к полутора
+    минутам записи, и отставание не рассасывается. Пока разметка не
+    покрыла слово, WhisperLiveKit держит его серой гипотезой — текст
+    «застывал» тем сильнее, чем дольше шла запись. Живой звук и так
+    приходит с реальной скоростью, тормозить его незачем.
+
+    Второе отличие: неполный блок не добивается нулями посреди записи.
+    Порции от WhisperLiveKit произвольной длины, и на каждой паузе между
+    ними исходный источник вставлял тишину, которой не было, — время diart
+    уходило вперёд времени слов. Остаток дожидается следующей порции, а
+    нулями дополняется только в самом конце записи.
+    """
+    global _REALTIME_SOURCE
+    if _REALTIME_SOURCE is not None:
+        return _REALTIME_SOURCE
+
+    from queue import Empty
+
+    import numpy as np
+    from whisperlivekit.diarization.diart_backend import WebSocketAudioSource
+
+    class RealtimeAudioSource(WebSocketAudioSource):
+        def _process_chunks(self) -> None:
+            try:
+                while not self._closed:
+                    try:
+                        chunk = self._queue.get(timeout=0.1)
+                    except Empty:
+                        continue
+                    self._emit(chunk)
+                # Хвост: всё, что успело прийти до закрытия, и неполный блок.
+                while True:
+                    try:
+                        self._emit(self._queue.get_nowait())
+                    except Empty:
+                        break
+                with self._buffer_lock:
+                    if len(self._buffer):
+                        padded = np.zeros(self.block_size, dtype=np.float32)
+                        padded[:len(self._buffer)] = self._buffer
+                        self._buffer = np.array([], dtype=np.float32)
+                        self.stream.on_next(padded.reshape(1, -1))
+            except Exception as exc:
+                log.exception("Источник звука diart остановился с ошибкой")
+                self.stream.on_error(exc)
+                return
+            self.stream.on_completed()
+
+        def _emit(self, chunk) -> None:
+            with self._buffer_lock:
+                self._buffer = np.concatenate([self._buffer, chunk])
+                while len(self._buffer) >= self.block_size:
+                    block = self._buffer[:self.block_size]
+                    self._buffer = self._buffer[self.block_size:]
+                    self.stream.on_next(block.reshape(1, -1))
+
+    _REALTIME_SOURCE = RealtimeAudioSource
+    return _REALTIME_SOURCE
 
 
 class _SessionDiart:
@@ -186,13 +324,9 @@ class _SessionDiart:
     def __init__(self, shared: _SharedDiartModels) -> None:
         from diart import SpeakerDiarization
         from diart.inference import StreamingInference
-        from whisperlivekit.diarization.diart_backend import (
-            DiarizationObserver,
-            WebSocketAudioSource,
-        )
 
-        self.observer = DiarizationObserver()
-        self.source = WebSocketAudioSource(
+        self.observer = _SegmentsObserver()
+        self.source = _realtime_source_class()(
             uri="scribe-live",
             sample_rate=shared.sample_rate,
             block_duration=shared.block_duration,
@@ -492,6 +626,13 @@ def normalize(response: Any) -> dict[str, Any]:
         "buffer": _drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),
         "buffer_speaker": (_get(response, "buffer_diarization") or "").strip(),
         "status": _get(response, "status") or "active",
+        # Отставание в секундах звука: распознавания — от поступившего
+        # звука, разметки говорящих — от распознанного текста. Пока
+        # разметка не догнала слово, оно висит серой гипотезой.
+        "lag": {
+            "asr": _seconds(_get(response, "remaining_time_transcription")),
+            "diarization": _seconds(_get(response, "remaining_time_diarization")),
+        },
     }
 
 
