@@ -74,6 +74,8 @@ def get_engine():
             # принимает оба варианта имён сам.
             _install_session_diart()
             _patch_diart_speaker_labels()
+        if settings.diarization_enabled:
+            _patch_word_continuations()
         log.info("Загружаю live-движок: %s", kwargs)
         with _trusted_checkpoints():
             _engine = TranscriptionEngine(**kwargs)
@@ -339,6 +341,46 @@ def _patch_diart_speaker_labels() -> None:
                 "ожидает их в разном виде в разных местах")
 
 
+def _patch_word_continuations() -> None:
+    """Не даёт говорящему смениться посреди слова в живом черновике.
+
+    SimulStreaming режет речь на порции, и слово на стыке порций приходит
+    двумя токенами: начало с ведущим пробелом (« Ск»), продолжение без
+    него («анируем»). Выравнивание WhisperLiveKit назначает говорящего
+    каждому токену отдельно, и если граница diart легла между кусками,
+    слово разрывается между двумя репликами: «Ск» у одного говорящего,
+    «анируем» у другого.
+
+    В апстриме уже есть ровно такой случай: одиночный знак препинания
+    всегда уходит к текущему говорящему, чтобы не плодить реплики из
+    одной точки. Эта проверка вызывается только в том месте обхода, и
+    мы расширяем её на продолжения слов. Новое слово Whisper всегда
+    выдаёт с пробелом, поэтому целые слова не прилипают к чужой реплике.
+    """
+    try:
+        from whisperlivekit.tokens_alignment import TokensAlignment
+    except Exception:
+        log.exception("Не удалось подключить склейку слов — в живом "
+                      "черновике слова могут рваться между говорящими")
+        return
+
+    original = getattr(TokensAlignment, "_is_punctuation_only", None)
+    if original is None:
+        log.error("В WhisperLiveKit нет _is_punctuation_only — склейка слов "
+                  "не подключена, проверьте версию")
+        return
+    if getattr(original, "_scribe_patched", False):
+        return
+
+    def stays_with_previous(token) -> bool:
+        text = getattr(token, "text", "") or ""
+        return original(token) or (bool(text) and not text[0].isspace())
+
+    stays_with_previous._scribe_patched = True
+    TokensAlignment._is_punctuation_only = staticmethod(stays_with_previous)
+    log.info("Говорящий в живом черновике меняется только на начале слова")
+
+
 def _check_names(kwargs: dict[str, Any]) -> None:
     """Сверяет имена параметров с конфигурацией установленной версии.
 
@@ -409,12 +451,29 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+# Галлюцинации Whisper на музыке и тишине: строчки из титров, на которых
+# модель обучалась. В живой речи они не встречаются, поэтому их можно
+# вырезать без риска потерять настоящие слова. Сознательно НЕ входят
+# сюда фразы вроде «Подписывайтесь» и «Спасибо за просмотр»: их говорят
+# и по-настоящему — в подкастах это обычная концовка.
+_HALLUCINATIONS = [
+    re.compile(r"Субтитры\s+\w+\s+(?:сообществом\s+)?(?:DimaTorzok|Dima\s*Torzok|Amara\.org)[.!]*", re.I),
+    re.compile(r"Редактор\s+субтитров\s+[А-ЯЁA-Z]\.\s*\w+(?:\s+Корректор\s+[А-ЯЁA-Z]\.\s*\w+)?[.!]*", re.I),
+]
+
+
+def _drop_hallucinations(text: str) -> str:
+    for pattern in _HALLUCINATIONS:
+        text = pattern.sub(" ", text)
+    return re.sub(r"\s{2,}", " ", text)
+
+
 def normalize(response: Any) -> dict[str, Any]:
     """Приводит ответ движка к формату, который понимает наш фронтенд."""
     raw_lines = _get(response, "lines") or []
     lines = []
     for line in raw_lines:
-        text = (_get(line, "text") or "").strip()
+        text = _drop_hallucinations(_get(line, "text") or "").strip()
         if not text:
             continue
         lines.append(
@@ -430,7 +489,7 @@ def normalize(response: Any) -> dict[str, Any]:
         "lines": lines,
         # Гипотеза, которую движок ещё может переписать. Показываем её
         # серым: честнее, чем выдавать неустоявшийся текст за готовый.
-        "buffer": (_get(response, "buffer_transcription") or "").strip(),
+        "buffer": _drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),
         "buffer_speaker": (_get(response, "buffer_diarization") or "").strip(),
         "status": _get(response, "status") or "active",
     }
