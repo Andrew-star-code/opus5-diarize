@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from contextlib import contextmanager
 from typing import Any
 
@@ -68,7 +69,10 @@ def get_engine():
 
         _check_names(kwargs)
         if settings.diarization_enabled and settings.live_diarization == "diart":
-            _patch_diart_kwargs()
+            # Своя диаризация на каждую запись. Прежний переходник имён
+            # аргументов (_patch_diart_kwargs) больше не нужен: наш класс
+            # принимает оба варианта имён сам.
+            _install_session_diart()
             _patch_diart_speaker_labels()
         log.info("Загружаю live-движок: %s", kwargs)
         with _trusted_checkpoints():
@@ -116,54 +120,175 @@ def _trusted_checkpoints():
         torch.load = original
 
 
-def _patch_diart_kwargs() -> None:
-    """Чинит рассинхрон внутри самого WhisperLiveKit 0.2.26.
+class _SharedDiartModels:
+    """То, что TranscriptionEngine хранит как diarization_model: только веса.
 
-    Его core.py вызывает собственный diart-бэкенд с именами
-    segmentation_model / embedding_model, а DiartDiarization ждёт те же
-    аргументы с суффиксом _name. Из-за этого живая диаризация падает на
-    TypeError ещё до первого куска аудио, и настройкой это не обойти:
-    вызов зашит внутри пакета.
+    Ни конвейера, ни потока, ни цикла событий — поэтому создаётся где
+    угодно, в том числе при прогреве в пуле потоков. Имена аргументов те,
+    с которыми его зовёт core.py WhisperLiveKit; варианты с суффиксом _name
+    приняты на случай, если апстрим приведёт вызов к сигнатуре
+    DiartDiarization.
+    """
 
-    Переименовываем аргументы на лету. Патч самоотключается: если в
-    установленной версии имена уже совпадают, мы ничего не трогаем.
+    def __init__(
+        self,
+        block_duration: float = 1.5,
+        sample_rate: int = 16000,
+        segmentation_model: str | None = None,
+        embedding_model: str | None = None,
+        segmentation_model_name: str | None = None,
+        embedding_model_name: str | None = None,
+        **_ignored: Any,
+    ) -> None:
+        import diart.models as models
+        import torch
+
+        self.block_duration = block_duration
+        self.sample_rate = sample_rate
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.segmentation = models.SegmentationModel.from_pretrained(
+            segmentation_model or segmentation_model_name or settings.live_segmentation_model
+        )
+        self.embedding = models.EmbeddingModel.from_pretrained(
+            embedding_model or embedding_model_name or settings.live_embedding_model
+        )
+        # Модели diart ленивые. Без явной загрузки веса читались бы с диска
+        # на первой записи — уже вне _trusted_checkpoints(), где torch.load
+        # их отвергнет.
+        for model in (self.segmentation, self.embedding):
+            model.to(self.device)  # LazyModel.to() сам вызывает load()
+            if hasattr(model, "eval"):
+                model.eval()
+
+    def new_config(self):
+        from diart import SpeakerDiarizationConfig
+
+        return SpeakerDiarizationConfig(
+            segmentation=self.segmentation,
+            embedding=self.embedding,
+            # У diart по умолчанию 20 — берём тот же предел, что у batch.
+            max_speakers=settings.max_speakers,
+            device=self.device,
+            sample_rate=self.sample_rate,
+        )
+
+
+class _SessionDiart:
+    """Диаризация одной живой записи.
+
+    Интерфейс ровно тот, что ждёт AudioProcessor от diart-бэкенда. Буфера
+    buffer_audio у него нет намеренно: по этому признаку AudioProcessor
+    понимает, что сегменты накопительные и их надо заменять, а не дописывать.
+    """
+
+    def __init__(self, shared: _SharedDiartModels) -> None:
+        from diart import SpeakerDiarization
+        from diart.inference import StreamingInference
+        from whisperlivekit.diarization.diart_backend import (
+            DiarizationObserver,
+            WebSocketAudioSource,
+        )
+
+        self.observer = DiarizationObserver()
+        self.source = WebSocketAudioSource(
+            uri="scribe-live",
+            sample_rate=shared.sample_rate,
+            block_duration=shared.block_duration,
+        )
+        self.inference = StreamingInference(
+            pipeline=SpeakerDiarization(config=shared.new_config()),
+            source=self.source,
+            do_plot=False,
+            show_progress=False,
+        )
+        self.inference.attach_observers(self.observer)
+        # Свой поток, а не run_in_executor: разбор живёт всю запись, и держать
+        # ради него слот общего пула незачем. Цикл событий ему не нужен.
+        self._thread = threading.Thread(target=self._run, name="diart-session", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            self.inference()
+        except Exception:
+            log.exception("Поток diart остановился с ошибкой")
+        finally:
+            # По этой строке в журнале видно, что запись за собой убрала.
+            # Ждать потока в close() нельзя: его зовут из цикла событий,
+            # и блокировка остановила бы все живые записи разом.
+            log.info("Поток diart завершён")
+
+    def insert_silence(self, duration: float) -> None:
+        self.observer.global_time_offset += duration
+
+    def insert_audio_chunk(self, pcm_array) -> None:
+        self.source.push_audio(pcm_array)
+
+    async def diarize(self):
+        return self.observer.get_segments()
+
+    def close(self) -> None:
+        self.source.close()
+
+
+def _install_session_diart() -> None:
+    """Даёт каждой живой записи собственную диаризацию diart.
+
+    В WhisperLiveKit 0.2.26 diart — одиночка на весь процесс:
+    TranscriptionEngine создаёт один DiartDiarization, а
+    online_diarization_factory отдаёт этот же объект каждой записи. Внутри
+    у него один источник звука, один поток разбора и одна история сегментов.
+
+    - Конец первой записи закрывал общий источник: AudioProcessor.cleanup()
+      зовёт close() у «своей» диаризации, а она общая. Дальше источник молча
+      выбрасывал весь звук, сегментов не было, и каждое слово получало
+      говорящего по умолчанию — «Спикер 1». По логам: в первой записи после
+      старта воркера diart нашёл двоих, во второй и третьей — ни одного
+      сегмента.
+    - Вторая запись и без того попадала бы в чужую историю: время diart
+      отсчитывается от первого звука процесса, а слова — от начала записи.
+    - Две записи одновременно смешивали бы звук в одном потоке.
+
+    Разводим так: веса грузятся один раз на процесс и остаются общими — это
+    дорого, а состояния в них нет. Конвейер со своими кластерами говорящих,
+    источник и наблюдатель создаются на каждую запись и умирают вместе с ней.
+
+    Заодно проходит прогрев. Старый DiartDiarization запускал разбор через
+    asyncio.get_event_loop() и в пуле потоков, где цикла нет, падал: прогрев
+    не удавался ни разу, и модель грузилась уже на первом подключении.
+
+    При обновлении WhisperLiveKit загляните в online_diarization_factory в
+    core.py: если diart там начнут создавать на каждую запись, переходник
+    станет лишним.
     """
     try:
-        import inspect
-
+        from whisperlivekit import audio_processor
         from whisperlivekit.diarization import diart_backend
     except Exception:
+        # Молча отступать нельзя: без подмены живая диаризация снова
+        # работает только в первой записи после старта воркера.
+        log.exception("Не удалось подменить diart — живая диаризация будет сломана")
         return
 
-    cls = diart_backend.DiartDiarization
-    if getattr(cls, "_scribe_patched", False):
+    if getattr(diart_backend, "_scribe_session_diart", False):
         return
 
-    params = inspect.signature(cls.__init__).parameters
-    renames = {
-        wrong: right
-        for wrong, right in (
-            ("segmentation_model", "segmentation_model_name"),
-            ("embedding_model", "embedding_model_name"),
-        )
-        if wrong not in params and right in params
-    }
-    if not renames:
-        return  # апстрим починили — переходник не нужен
+    # core.py импортирует класс в момент вызова, так что подмена в модуле
+    # действует и на него.
+    diart_backend.DiartDiarization = _SharedDiartModels
 
-    original = cls.__init__
+    original_factory = audio_processor.online_diarization_factory
 
-    def patched(self, *args, **kwargs):
-        for wrong, right in renames.items():
-            if wrong in kwargs:
-                kwargs[right] = kwargs.pop(wrong)
-        return original(self, *args, **kwargs)
+    def factory(args, diarization_backend):
+        if isinstance(diarization_backend, _SharedDiartModels):
+            return _SessionDiart(diarization_backend)
+        return original_factory(args, diarization_backend)
 
-    cls.__init__ = patched
-    cls._scribe_patched = True
+    # audio_processor забрал функцию к себе при импорте — подменять надо там.
+    audio_processor.online_diarization_factory = factory
+    diart_backend._scribe_session_diart = True
     log.warning(
-        "WhisperLiveKit зовёт diart с устаревшими именами аргументов, "
-        "переименовываю: %s", renames,
+        "diart в WhisperLiveKit общий на весь процесс — даю каждой записи свой конвейер"
     )
 
 

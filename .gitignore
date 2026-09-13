@@ -1,6 +1,8 @@
 # данные и модели
 /data/audio/*
 /data/logs/*
+# тестовые потоки для проверки живого режима
+/data/*.webm
 !/data/audio/.gitkeep
 !/data/logs/.gitkeep
 /models/*
