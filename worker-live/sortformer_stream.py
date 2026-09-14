@@ -14,6 +14,8 @@ streaming_feat_loader), но для звука, который приходит 
 from __future__ import annotations
 
 import math
+import threading
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -48,6 +50,13 @@ def configure(model, latency: float) -> None:
     model.sortformer_modules._check_streaming_parameters()
 
 
+# Настройки порций NeMo читает с модели прямо во время шага
+# (streaming_update, _compress_spkcache, _gather_spkcache_and_preds).
+# Чтобы потоки с разной задержкой делили одну модель, каждый выставляет
+# свои настройки под этой блокировкой на время шага.
+_MODEL_LOCK = threading.Lock()
+
+
 class SortformerStream:
     """Потоковая диаризация одной записи.
 
@@ -57,16 +66,21 @@ class SortformerStream:
     хвост в конце записи.
     """
 
-    def __init__(self, model, threshold: float = 0.5):
+    def __init__(self, model, threshold: float = 0.5, latency: float | None = None):
         self.model = model
         sm = model.sortformer_modules
         feat = model.preprocessor.featurizer
         self.hop = int(feat.hop_length)
         self.half = int(feat.n_fft) // 2
+        # latency — свой набор настроек порций из PRESETS; None — те, что
+        # выставлены на модели сейчас (так работает стенд через configure).
+        self.preset = PRESETS[latency] if latency is not None else None
+        chunk_len = self.preset["chunk_len"] if self.preset else sm.chunk_len
+        right_ctx = self.preset["chunk_right_context"] if self.preset else sm.chunk_right_context
         self.sub = int(sm.subsampling_factor)
-        self.chunk = sm.chunk_len * self.sub          # кадров признаков в порции
+        self.chunk = chunk_len * self.sub             # кадров признаков в порции
         self.left = sm.chunk_left_context * self.sub
-        self.right = sm.chunk_right_context * self.sub
+        self.right = right_ctx * self.sub
         # Запас по краям окна: n_fft/2 сэмплов на кадр плюс предыскажение,
         # которое тянет за собой предыдущий сэмпл.
         self.margin = math.ceil(self.half / self.hop) + 2
@@ -79,7 +93,7 @@ class SortformerStream:
         self.samples = 0       # всего сэмплов принято
         self.stt = 0           # первый кадр признаков следующей порции
         self.frames_out = 0    # кадров модели уже выдано
-        with torch.inference_mode():
+        with self._settings(), torch.inference_mode():
             self.state = sm.init_streaming_state(
                 batch_size=1, async_streaming=model.async_streaming, device=model.device
             )
@@ -107,6 +121,15 @@ class SortformerStream:
 
     # --------------------------------------------------------------- внутреннее
 
+    @contextmanager
+    def _settings(self):
+        """Свои настройки порций на модели — на время шага, под общей блокировкой."""
+        with _MODEL_LOCK:
+            if self.preset:
+                for key, value in self.preset.items():
+                    setattr(self.model.sortformer_modules, key, value)
+            yield
+
     def _ready_frames(self) -> int:
         """Сколько кадров признаков уже не изменит будущий звук."""
         if self.samples < self.half:
@@ -126,7 +149,7 @@ class SortformerStream:
 
     def _run(self, end: int, right: int) -> list[tuple[float, float, int]]:
         left = min(self.left, self.stt)
-        with torch.inference_mode():
+        with self._settings(), torch.inference_mode():
             chunk = self._features(self.stt - left, end + right).transpose(1, 2)
             length = torch.tensor([chunk.shape[1]], device=self.model.device)
             empty = torch.zeros((1, 0, self.n_spk), device=self.model.device)

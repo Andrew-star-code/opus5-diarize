@@ -559,9 +559,29 @@ class _SessionSortformer:
 
     def __init__(self, shared_model: _SharedSortformer, max_speakers: int | None = None,
                  **_ignored: Any) -> None:
-        from sortformer_stream import SortformerStream
+        from sortformer_stream import PRESETS, SortformerStream
 
-        self.stream = SortformerStream(shared_model.model)
+        self.stream = SortformerStream(shared_model.model, latency=settings.live_sortformer_latency)
+        # Второй проход: та же модель с запасом по времени идёт следом и
+        # перемечает уже выданные отрезки. Кто говорит, она видит заметно
+        # точнее: сквозной замер — 13,5% слов под чужим именем против 15,2%,
+        # начало реплики уходит предыдущему в 32% смен против 43%.
+        refine = settings.live_sortformer_refine_latency
+        if refine and refine not in PRESETS:
+            log.error("LIVE_SORTFORMER_REFINE_LATENCY=%s нет среди %s — второй проход выключен",
+                      refine, sorted(PRESETS))
+            refine = 0
+        self.slow = SortformerStream(shared_model.model, latency=refine) if refine else None
+        # Выданные отрезки быстрого прохода: время потока, метка и куски,
+        # ушедшие в WhisperLiveKit. Он хранит их по ссылке и при каждом
+        # обновлении заново раздаёт слова говорящим, поэтому поправка метки
+        # на месте доходит до реплик сама.
+        self._fast: list[tuple[float, float, int, list]] = []
+        self._fixed = 0                    # сколько из них уже сверено
+        self._slow: list[tuple[float, float, int]] = []
+        self._slow_from = 0                # первый ещё нужный медленный отрезок
+        self._overlap: dict[tuple[int, int], float] = {}  # (медленная, быстрая) → секунды
+        self.relabeled = 0
         self.buffer_audio = None  # признак буферного бэкенда для AudioProcessor
         # Вырезанные паузы. Фильтр тишины не пускает их в разметку, а время
         # слов их включает, так что время потока надо переводить в настоящее.
@@ -598,23 +618,96 @@ class _SessionSortformer:
 
     def insert_audio_chunk(self, pcm_array) -> None:
         self.stream.push(pcm_array)
+        if self.slow is not None:
+            self.slow.push(pcm_array)
 
     async def diarize(self):
         import asyncio
 
         from whisperlivekit.timed_objects import SpeakerSegment
 
-        segments = await asyncio.to_thread(self.stream.step)
-        return [
-            SpeakerSegment(speaker=speaker, start=a, end=b)
-            for start, end, speaker in segments
-            for a, b in self._real_time(start, end)
-        ]
+        fast, slow = await asyncio.to_thread(self._step)
+        out = []
+        for start, end, speaker in fast:
+            pieces = [SpeakerSegment(speaker=speaker, start=a, end=b)
+                      for a, b in self._real_time(start, end)]
+            self._fast.append((start, end, speaker, pieces))
+            out += pieces
+        if slow:
+            # Перемечаем здесь, в цикле событий, а не в потоке: выравнивание
+            # WhisperLiveKit читает эти объекты тоже из цикла событий.
+            self._slow += slow
+            self._reconcile()
+        return out
+
+    def _step(self):
+        fast = self.stream.step()
+        slow = self.slow.step() if self.slow is not None else []
+        return fast, slow
+
+    def _reconcile(self) -> None:
+        """Отрезки быстрого прохода, которые уже покрыл медленный, получают его метку."""
+        slow, slow_end = self._slow, self.slow.frames_out * self.slow.frame_sec
+        batch = []
+        while self._fixed < len(self._fast) and self._fast[self._fixed][1] <= slow_end:
+            start, end, fast_label, pieces = self._fast[self._fixed]
+            self._fixed += 1
+            # Отрезки обоих проходов идут по времени начала — медленные,
+            # закончившиеся до начала этого быстрого, больше не понадобятся.
+            while self._slow_from < len(slow) and slow[self._slow_from][1] <= start:
+                self._slow_from += 1
+            votes: dict[int, float] = {}
+            k = self._slow_from
+            while k < len(slow) and slow[k][0] < end:
+                overlap = min(end, slow[k][1]) - max(start, slow[k][0])
+                if overlap > 0:
+                    votes[slow[k][2]] = votes.get(slow[k][2], 0.0) + overlap
+                k += 1
+            if votes:
+                best = max(votes, key=votes.get)
+                key = (best, fast_label)
+                self._overlap[key] = self._overlap.get(key, 0.0) + votes[best]
+                batch.append((best, fast_label, pieces))
+        if not batch:
+            return
+        mapping = self._mapping()
+        for best, fast_label, pieces in batch:
+            target = mapping.get(best, fast_label)
+            if target != fast_label:
+                for piece in pieces:
+                    piece.speaker = target
+                self.relabeled += 1
+        if self._slow_from > 1000:
+            del slow[: self._slow_from]
+            self._slow_from = 0
+
+    def _mapping(self) -> dict[int, int]:
+        """Метка медленного прохода → метка быстрого, по накопленным перекрытиям.
+
+        Проходы нумеруют говорящих каждый по-своему, в порядке появления.
+        Показываем нумерацию быстрого: её пользователь уже видел. Говорящий,
+        которого быстрый проход слил с другим, получает свой номер после
+        четырёх каналов модели.
+        """
+        import numpy as np
+        from scipy.optimize import linear_sum_assignment
+
+        slow_labels = sorted({s for s, _ in self._overlap})
+        fast_labels = sorted({f for _, f in self._overlap})
+        matrix = np.zeros((len(slow_labels), len(fast_labels)))
+        for (s, f), seconds in self._overlap.items():
+            matrix[slow_labels.index(s), fast_labels.index(f)] = seconds
+        rows, cols = linear_sum_assignment(-matrix)
+        mapping = {slow_labels[r]: fast_labels[c] for r, c in zip(rows, cols)}
+        for s in slow_labels:
+            mapping.setdefault(s, 4 + s)
+        return mapping
 
     def close(self) -> None:
         # Хвост короче порции не дожимаем: черновик после остановки
         # всё равно заменяет чистовик.
         self.stream = None
+        self.slow = None
 
 
 def _install_session_sortformer() -> None:

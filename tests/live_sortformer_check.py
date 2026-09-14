@@ -45,7 +45,7 @@ async def main() -> int:
     stream = session.stream
     budget = (stream.chunk + stream.right) * stream.hop / SR + 0.1  # порция + заглядывание + кусок
 
-    segments, worst_lag = [], 0.0
+    segments, emitted, worst_lag = [], [], 0.0
     piece = int(PIECE * SR)
     for i in range(0, len(audio), piece):
         session.insert_audio_chunk(audio[i:i + piece])
@@ -54,6 +54,7 @@ async def main() -> int:
             if not new:
                 break
             segments += new
+            emitted += [s.speaker for s in new]
         pushed = min(len(audio), i + piece) / SR
         worst_lag = max(worst_lag, pushed - stream.frames_out * stream.frame_sec)
 
@@ -61,6 +62,16 @@ async def main() -> int:
     print(f"сегментов {len(segments)}, говорящие {speakers}, "
           f"наибольшее отставание разметки {worst_lag:.2f} с (допуск {budget:.2f} с)")
     check(len(speakers) >= 2, "нашлось не меньше двух говорящих")
+
+    # Второй проход перемечает выданные отрезки на месте — но только те,
+    # что уже покрыл медленный поток, и только номерами говорящих модели.
+    if session.slow is not None:
+        fixed = {id(p) for record in session._fast[: session._fixed] for p in record[3]}
+        changed = [s for s, before in zip(segments, emitted) if s.speaker != before]
+        print(f"второй проход: сверено отрезков {session._fixed} из {len(session._fast)}, "
+              f"перемечено {session.relabeled}, кусков с новой меткой {len(changed)}")
+        check(all(id(s) in fixed for s in changed), "метки меняются только там, где прошёл медленный проход")
+        check(all(0 <= s.speaker < 8 for s in segments), "номера говорящих — в пределах каналов модели")
     check(all(s.end > s.start for s in segments), "у каждого сегмента конец позже начала")
     starts = [s.start for s in segments]
     check(max(np.diff(starts), default=0) < 30 and min(np.diff(starts), default=0) > -1.0,
