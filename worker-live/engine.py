@@ -75,6 +75,9 @@ def get_engine():
             # принимает оба варианта имён сам.
             _install_session_diart()
             _patch_diart_speaker_labels()
+        if settings.diarization_enabled and settings.live_diarization == "sortformer":
+            # Своя модель порций и свой поток на запись — см. _SessionSortformer.
+            _install_session_sortformer()
         if settings.diarization_enabled:
             _patch_word_continuations()
         log.info("Загружаю live-движок: %s", kwargs)
@@ -513,6 +516,95 @@ def _patch_word_continuations() -> None:
     stays_with_previous._scribe_patched = True
     TokensAlignment._is_punctuation_only = staticmethod(stays_with_previous)
     log.info("Говорящий в живом черновике меняется только на начале слова")
+
+
+class _SharedSortformer:
+    """Streaming Sortformer, одна модель на процесс.
+
+    Встаёт на место SortformerDiarization из WhisperLiveKit. Тот грузит
+    модель по имени через сеть и ставит свои настройки порций: порция в
+    секунду без заглядывания вперёд и subsampling 10 при кадре модели 8.
+    Здесь — локальный .nemo из кеша (сервис живёт без сети) и настройки
+    из статьи, те же, что на стенде (bench/eval_sortformer.py).
+    """
+
+    def __init__(self, model_name: str | None = None, model_path: str | None = None,
+                 **_ignored: Any) -> None:
+        import torch
+        from huggingface_hub import hf_hub_download
+        from nemo.collections.asr.models import SortformerEncLabelModel
+        from sortformer_stream import configure
+
+        repo = settings.live_sortformer_model
+        # С HF_HUB_OFFLINE=1 hf_hub_download берёт файл из кеша и в сеть не
+        # ходит; сам .nemo кладёт туда scripts/prefetch_models.py.
+        path = model_path or hf_hub_download(repo, f"{repo.rsplit('/', 1)[-1]}.nemo")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = SortformerEncLabelModel.restore_from(path, map_location=device)
+        self.model.eval()
+        configure(self.model, settings.live_sortformer_latency)
+        log.info("Sortformer готов: %s, задержка %.2f с", repo, settings.live_sortformer_latency)
+
+
+class _SessionSortformer:
+    """Диаризация одной живой записи на общей модели Sortformer.
+
+    Интерфейс — тот, что AudioProcessor ждёт от буферного бэкенда: по
+    атрибуту buffer_audio он понимает, что diarize() надо звать, пока она
+    не вернёт пусто, а сегменты — дописывать к прежним. Звук вставляется и
+    разбирается по очереди в одной сопрограмме, так что блокировка не
+    нужна; сам шаг модели уходит в поток, чтобы не держать цикл событий.
+    """
+
+    def __init__(self, shared_model: _SharedSortformer, max_speakers: int | None = None,
+                 **_ignored: Any) -> None:
+        from sortformer_stream import SortformerStream
+
+        self.stream = SortformerStream(shared_model.model)
+        self.buffer_audio = None  # признак буферного бэкенда для AudioProcessor
+        self.offset = 0.0         # вырезанная тишина: время слов её включает
+
+    def insert_silence(self, duration: float | None) -> None:
+        self.offset += duration or 0.0
+
+    def insert_audio_chunk(self, pcm_array) -> None:
+        self.stream.push(pcm_array)
+
+    async def diarize(self):
+        import asyncio
+
+        from whisperlivekit.timed_objects import SpeakerSegment
+
+        segments = await asyncio.to_thread(self.stream.step)
+        return [
+            SpeakerSegment(speaker=speaker, start=start + self.offset, end=end + self.offset)
+            for start, end, speaker in segments
+        ]
+
+    def close(self) -> None:
+        # Хвост короче порции не дожимаем: черновик после остановки
+        # всё равно заменяет чистовик.
+        self.stream = None
+
+
+def _install_session_sortformer() -> None:
+    """Подменяет Sortformer из WhisperLiveKit нашим — см. _SharedSortformer.
+
+    core.py и online_diarization_factory импортируют оба класса из модуля
+    в момент вызова, так что подмены в модуле достаточно.
+    """
+    try:
+        from whisperlivekit.diarization import sortformer_backend
+    except (Exception, SystemExit):
+        # Без NeMo модуль делает SystemExit — это тоже надо поймать.
+        log.exception("Не удалось подключить Sortformer — живая диаризация не заработает")
+        return
+    if getattr(sortformer_backend, "_scribe_session_sortformer", False):
+        return
+    sortformer_backend.SortformerDiarization = _SharedSortformer
+    sortformer_backend.SortformerDiarizationOnline = _SessionSortformer
+    sortformer_backend._scribe_session_sortformer = True
+    log.info("Sortformer: локальная модель, порции из статьи, свой поток на запись")
 
 
 def _check_names(kwargs: dict[str, Any]) -> None:
