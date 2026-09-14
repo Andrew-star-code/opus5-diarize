@@ -6,13 +6,16 @@
 from __future__ import annotations
 
 import logging
+import re
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlmodel import Session as DBSession
+from sqlmodel import select
 
 from .. import schemas
 from ..config import settings
-from ..models import (Job, JobState, JobType, Session, SourceType, Quality,
+from ..models import (Job, JobState, JobType, Session, SourceType, Speaker, Quality,
                       Status, utcnow)
 from ..services import events, jobs, transcripts
 from .deps import get_db
@@ -87,6 +90,36 @@ def report_progress(
     )
 
 
+# Название, которое сервис придумал сам: у живой записи — дата, у
+# загруженной — имя файла. Только такое заменяет название от модели.
+_AUTO_TITLE = re.compile(r"^Запись \d{2}\.\d{2}\.\d{4} \d{2}:\d{2}$")
+
+
+def _title_untouched(session: Session) -> bool:
+    title = (session.title or "").strip()
+    if not title or _AUTO_TITLE.match(title):
+        return True
+    return bool(session.original_filename) and title == Path(session.original_filename).stem[:200]
+
+
+def _apply_notes(db: DBSession, session: Session, result: schemas.JobResult) -> None:
+    """Название, краткое содержание и подсказки имён от языковой модели.
+
+    Всё необязательно. Название, которое пользователь дал сам, не
+    трогаем; имя подсказываем только тем говорящим, кого он ещё не назвал.
+    """
+    if result.summary.strip():
+        session.summary = result.summary.strip()[:4000]
+    if result.title and result.title.strip() and _title_untouched(session):
+        session.title = result.title.strip()[:120]
+    if result.speaker_names:
+        for sp in db.exec(select(Speaker).where(Speaker.session_id == session.id)):
+            name = (result.speaker_names.get(sp.label) or "").strip()[:80]
+            if name and sp.display_name == transcripts._generated_name(sp):
+                sp.suggested_name = name
+                db.add(sp)
+
+
 @router.post("/jobs/{job_id}/result", status_code=204)
 def submit_result(
     job_id: str,
@@ -105,6 +138,7 @@ def submit_result(
         duration_sec=result.duration_sec,
         model_info=result.model_info,
     )
+    _apply_notes(db, session, result)
     session.status = Status.READY
     session.error = None
 

@@ -70,6 +70,8 @@ class Session(SQLModel, table=True):
     # Сколько человек говорит. 0 — определять автоматически. Точное число
     # заметно улучшает разделение: иначе модель гадает в широком диапазоне.
     num_speakers: int = 0
+    # Краткое содержание от языковой модели: пункты через перевод строки.
+    summary: str = ""
 
 
 class Speaker(SQLModel, table=True):
@@ -81,6 +83,9 @@ class Speaker(SQLModel, table=True):
     display_name: str = ""          # что видит пользователь
     color: str = "#64748b"
     order: int = 0
+    # Подсказка имени от языковой модели; сбрасывается, как только
+    # пользователь вписал имя сам.
+    suggested_name: str = ""
 
 
 class Segment(SQLModel, table=True):

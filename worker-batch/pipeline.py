@@ -11,6 +11,7 @@ import asr
 import decode
 import diarize
 import merge
+import polish
 from config import settings
 
 log = logging.getLogger(__name__)
@@ -20,7 +21,8 @@ STAGES = {
     "decode": (0.00, 0.05),
     "asr": (0.05, 0.65),
     "diarize": (0.65, 0.95),
-    "merge": (0.95, 1.00),
+    "merge": (0.95, 0.96),
+    "polish": (0.96, 1.00),
 }
 
 
@@ -28,6 +30,54 @@ def _scaled(report: Callable[[str, float], None], stage: str) -> Callable[[float
     """Переводит прогресс этапа (0..1) в общий прогресс задания."""
     lo, hi = STAGES[stage]
     return lambda fraction: report(stage, lo + (hi - lo) * max(0.0, min(1.0, fraction)))
+
+
+def _polish_labels(
+    words: list[merge.Word], labels: list[str | None], progress: Callable[[float], None]
+) -> tuple[list[str | None], str | None]:
+    """Поправка стыков реплик языковой моделью — надстройка, может не случиться.
+
+    Возвращает метки и имя модели, если она поработала. Выключена,
+    недоступна или сбоит — метки остаются как были.
+    """
+    if not settings.llm_fix_speakers:
+        return labels, None
+    from llm import LLM
+
+    progress(0.0)
+    client = LLM()
+    try:
+        if not client.available():
+            return labels, None
+        fixed, stats = polish.adjust_boundaries(
+            words, labels, client.ask, max_shift=settings.llm_max_shift
+        )
+        log.info("Стыки реплик: границ %d, спрошено %d, сдвинуто %d (%d слов)",
+                 stats["boundaries"], stats["asked"], stats["moved"], stats["words"])
+        return fixed, (client.model if stats["asked"] else None)
+    finally:
+        client.close()
+        progress(0.5)
+
+
+def _describe(segments: list[merge.Segment], progress: Callable[[float], None]) -> dict[str, Any]:
+    """Название, краткое содержание, подсказки имён — языковой моделью, если она есть."""
+    if not settings.llm_notes or not segments:
+        return {}
+    from llm import LLM
+
+    client = LLM()
+    try:
+        if not client.available():
+            return {}
+        notes = polish.describe(segments, client.ask)
+        log.info("Полировка: название %s, пунктов краткого содержания %d, подсказано имён %d",
+                 "есть" if notes.get("title") else "нет",
+                 len(notes.get("summary", "").splitlines()), len(notes.get("speaker_names", {})))
+        return notes
+    finally:
+        client.close()
+        progress(1.0)
 
 
 def process(job: dict[str, Any], report: Callable[[str, float], None]) -> dict[str, Any]:
@@ -67,15 +117,24 @@ def process(job: dict[str, Any], report: Callable[[str, float], None]) -> dict[s
         # 4. слияние
         merge_progress = _scaled(report, "merge")
         merge_progress(0.0)
+        polished_by = None
         if words:
             labels = merge.assign_speakers(
                 words, turns, smooth=settings.smooth_speaker_turns
             )
+            merge_progress(1.0)
+            # 5. стыки реплик по смыслу — языковой моделью, если она есть
+            labels, polished_by = _polish_labels(words, labels, _scaled(report, "polish"))
             segments = merge.build_segments(words, labels)
         else:
             # Пословных таймингов нет — размечаем целыми фразами.
             log.warning("Пословные тайминги отсутствуют, размечаю по фразам")
             segments = merge.segments_from_asr_only(asr_segments, turns)
+
+        # 6. название, краткое содержание, имена — тоже языковой моделью
+        notes = _describe(segments, _scaled(report, "polish"))
+        if notes and not polished_by:
+            polished_by = settings.llm_model
 
         payload = {
             "language": language,
@@ -85,7 +144,11 @@ def process(job: dict[str, Any], report: Callable[[str, float], None]) -> dict[s
                 "compute_type": settings.compute_type,
                 "diarization": settings.diarization_model,
                 "pipeline": "batch",
+                **({"llm": polished_by} if polished_by else {}),
             },
+            "title": notes.get("title"),
+            "summary": notes.get("summary", ""),
+            "speaker_names": notes.get("speaker_names", {}),
             "segments": [
                 {
                     "start": round(s.start, 3),
@@ -100,7 +163,6 @@ def process(job: dict[str, Any], report: Callable[[str, float], None]) -> dict[s
                 for s in segments
             ],
         }
-        merge_progress(1.0)
         log.info("Задание %s: %d реплик, %.1f сек аудио",
                  job_id, len(segments), duration)
         return payload

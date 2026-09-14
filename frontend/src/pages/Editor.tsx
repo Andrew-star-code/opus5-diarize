@@ -266,6 +266,7 @@ export default function Editor() {
 
       <div className="mt-6 grid gap-8 lg:grid-cols-[1fr_236px]">
         <div className="min-w-0">
+          {session.summary && <SummaryPanel summary={session.summary} />}
           <div className="mb-2 flex items-center gap-3">
             <input
               ref={search}
@@ -345,6 +346,26 @@ function countMatches(session: SessionDetail, query: string): string {
     }
   }
   return count === 0 ? "ничего" : `${count}`;
+}
+
+function SummaryPanel({ summary }: { summary: string }) {
+  const points = summary
+    .split("\n")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return (
+    <div className="panel mb-4 px-4 py-3">
+      <h2 className="eyebrow">Кратко</h2>
+      <ul className="mt-2 list-disc space-y-1 pl-5 text-sm">
+        {points.map((point, i) => (
+          <li key={i}>{point}</li>
+        ))}
+      </ul>
+      <p className="mt-2 text-[11px] text-mist">
+        Составлено языковой моделью по чистовику — может ошибаться.
+      </p>
+    </div>
+  );
 }
 
 function ProgressBanner({

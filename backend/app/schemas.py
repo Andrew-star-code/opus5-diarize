@@ -20,6 +20,9 @@ class SpeakerOut(BaseModel):
     display_name: str
     color: str
     order: int
+    # Имя, которое языковая модель нашла в разговоре («Андрей, скажи…»).
+    # Только подсказка: пусто, если имя уже вписано пользователем.
+    suggested_name: str = ""
 
 
 class SegmentOut(BaseModel):
@@ -58,6 +61,8 @@ class SessionDetail(SessionBrief):
     num_speakers: int = 0
     original_filename: Optional[str] = None
     model_info: dict[str, Any] = Field(default_factory=dict)
+    # Краткое содержание от языковой модели: пункты через перевод строки.
+    summary: str = ""
     speakers: list[SpeakerOut] = Field(default_factory=list)
     segments: list[SegmentOut] = Field(default_factory=list)
 
@@ -127,6 +132,11 @@ class JobResult(BaseModel):
     duration_sec: float = 0.0
     model_info: dict[str, Any] = Field(default_factory=dict)
     segments: list[ResultSegment] = Field(default_factory=list)
+    # Полировка языковой моделью — всё необязательно: модель могла быть
+    # выключена или недоступна.
+    title: Optional[str] = None
+    summary: str = ""
+    speaker_names: dict[str, str] = Field(default_factory=dict)  # метка → имя
 
 
 class JobFailure(BaseModel):

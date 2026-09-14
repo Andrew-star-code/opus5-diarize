@@ -174,6 +174,35 @@ def fetch_repo(repo: str) -> None:
         print(f"      {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+LLM_URL = os.environ.get("LLM_URL", "http://llm:11434")
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3:8b")
+
+
+def fetch_llm(model: str) -> None:
+    """Языковая модель для чистовика: скачивает сам сервис llm (Ollama)."""
+    import json
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(f"{LLM_URL}/api/tags", timeout=5)
+    except Exception:
+        report(f"llm:{model}", "пропуск")
+        print(f"      сервис llm не отвечает ({LLM_URL}) — сначала docker compose up -d llm")
+        return
+    try:
+        request = urllib.request.Request(
+            f"{LLM_URL}/api/pull",
+            data=json.dumps({"model": model, "stream": False}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=3600) as response:
+            status = json.loads(response.read() or b"{}").get("status", "")
+        report(f"llm:{model}", "готово" if status == "success" else "ОШИБКА")
+    except Exception as exc:
+        report(f"llm:{model}", "ОШИБКА")
+        print(f"      {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 SORTFORMER = os.environ.get("LIVE_SORTFORMER_MODEL", "nvidia/diar_streaming_sortformer_4spk-v2.1")
 
 
@@ -217,6 +246,9 @@ def main() -> int:
     fetch_sortformer(SORTFORMER)
     for repo in DIART_MODELS:
         fetch_repo(repo)
+
+    print("\nЯзыковая модель для чистовика:")
+    fetch_llm(LLM_MODEL)
 
     failed = [name for name, status in results if status == "ОШИБКА"]
     done = [name for name, status in results if status == "готово"]

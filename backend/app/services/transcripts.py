@@ -95,7 +95,7 @@ def _generated_name(sp: Speaker) -> str:
 def _to_speaker_out(sp: Speaker) -> schemas.SpeakerOut:
     return schemas.SpeakerOut(
         id=sp.id, label=sp.label, display_name=sp.display_name,
-        color=sp.color, order=sp.order,
+        color=sp.color, order=sp.order, suggested_name=sp.suggested_name,
     )
 
 
@@ -203,6 +203,7 @@ def to_detail(db: DBSession, s: Session) -> schemas.SessionDetail:
         prompt=s.prompt,
         num_speakers=s.num_speakers,
         model_info=model_info,
+        summary=s.summary,
         speakers=[_to_speaker_out(sp) for sp in speakers],
         segments=[_to_segment_out(seg) for seg in segments],
     )

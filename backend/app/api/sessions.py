@@ -152,6 +152,9 @@ def patch_speaker(
         raise HTTPException(404, "Спикер не найден")
     if patch.display_name is not None:
         speaker.display_name = patch.display_name.strip()[:80] or speaker.display_name
+        # Имя вписано — подсказка модели больше не нужна, даже если это
+        # и было её имя.
+        speaker.suggested_name = ""
     if patch.color is not None:
         speaker.color = patch.color
     db.add(speaker)

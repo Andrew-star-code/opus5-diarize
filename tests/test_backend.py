@@ -118,6 +118,10 @@ with TestClient(app) as client:
             "language": "ru", "duration_sec": 5.0,
             "model_info": {"asr": "large-v3", "pipeline": "batch"},
             "segments": FINAL,
+            # Полировка языковой моделью: название, краткое содержание, имя.
+            "title": "Планёрка по отчёту",
+            "summary": "Обсудили отчёт\nРешили начать планёрку",
+            "speaker_names": {"SPEAKER_00": "Антон"},
         },
     )
     check("результат принят", r.status_code == 204, r.text[:200])
@@ -127,11 +131,35 @@ with TestClient(app) as client:
     check("статус ready", detail["status"] == "ready", detail["status"])
     check("пословные тайминги приехали", len(detail["segments"][0]["words"]) == 3)
     check("аудио доступно", detail["audio_url"] is not None)
+    check("краткое содержание сохранено", detail["summary"] == "Обсудили отчёт\nРешили начать планёрку",
+          detail.get("summary"))
+    check("своё название не перезаписано", detail["title"] == "Планёрка", detail["title"])
+    suggested = {s["label"]: s["suggested_name"] for s in detail["speakers"]}
+    check("имя подсказано только найденному говорящему",
+          suggested == {"SPEAKER_00": "Антон", "SPEAKER_01": ""}, suggested)
+
+    print("\nавтоназвание заменяется названием от модели")
+    r = client.post("/api/internal/live/sessions", json={"language": "ru"})
+    auto_id = r.json()["id"]
+    check("автоназвание по дате", r.json()["title"].startswith("Запись "), r.json()["title"])
+    make_wav(WORK / "data" / "audio" / auto_id / "live.wav", 5.0)
+    client.post(f"/api/internal/live/sessions/{auto_id}/finalize", json={
+        "audio_path": f"audio/{auto_id}/live.wav", "duration_sec": 5.0,
+        "segments": DRAFT, "model_info": {"pipeline": "live"}, "refine": True,
+    })
+    auto_job = client.get("/api/internal/jobs/next", params={"types": "batch,refine"}).json()
+    client.post(f"/api/internal/jobs/{auto_job['id']}/result", json={
+        "language": "ru", "duration_sec": 5.0, "segments": FINAL, "title": "Итоги квартала",
+    })
+    check("нетронутое название заменено", client.get(f"/api/sessions/{auto_id}").json()["title"]
+          == "Итоги квартала")
+    client.delete(f"/api/sessions/{auto_id}")
 
     print("\nредактирование")
     speaker = detail["speakers"][0]
     r = client.patch(f"/api/speakers/{speaker['id']}", json={"display_name": "Антон"})
     check("говорящий переименован", r.json()["display_name"] == "Антон", r.text[:150])
+    check("подсказка имени сброшена", r.json()["suggested_name"] == "", r.json().get("suggested_name"))
 
     segment = detail["segments"][0]
     r = client.patch(f"/api/segments/{segment['id']}", json={"text": "Привет, начинаем планёрку."})

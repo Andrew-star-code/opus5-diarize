@@ -13,6 +13,8 @@ export interface Speaker {
   display_name: string;
   color: string;
   order: number;
+  /** Имя, найденное языковой моделью в разговоре; пусто — подсказки нет. */
+  suggested_name: string;
 }
 
 export interface Segment {
@@ -58,6 +60,8 @@ export interface SessionDetail extends SessionBrief {
   num_speakers: number;
   original_filename: string | null;
   model_info: Record<string, unknown>;
+  /** Краткое содержание от языковой модели: пункты через перевод строки. */
+  summary: string;
   speakers: Speaker[];
   segments: Segment[];
 }

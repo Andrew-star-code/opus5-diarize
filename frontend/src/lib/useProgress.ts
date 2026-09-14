@@ -13,6 +13,7 @@ const STAGE_LABELS: Record<string, string> = {
   asr: "Распознаю речь",
   diarize: "Разделяю голоса",
   merge: "Собираю транскрипт",
+  polish: "Сверяю реплики по смыслу",
   done: "Готово",
 };
 

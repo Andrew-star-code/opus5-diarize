@@ -43,6 +43,18 @@ export function SpeakerPanel({ speakers, stats, onRename }: SpeakerPanelProps) {
                 )}
               </div>
 
+              {speaker.suggested_name && speaker.suggested_name !== speaker.display_name && (
+                <p className="mt-1 ml-[18px] text-[11px] text-mist">
+                  Похоже, это {speaker.suggested_name} ·{" "}
+                  <button
+                    className="underline decoration-dotted hover:text-ink"
+                    onClick={() => onRename(speaker.id, speaker.suggested_name)}
+                  >
+                    принять
+                  </button>
+                </p>
+              )}
+
               {row && (
                 <>
                   <div className="mt-1.5 ml-[18px] h-[3px] overflow-hidden rounded-full bg-sunk">
