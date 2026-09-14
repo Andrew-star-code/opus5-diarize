@@ -67,16 +67,23 @@ async def main() -> int:
           "сегменты идут по времени, без скачков назад")
     check(worst_lag <= budget, "разметка не отстаёт больше чем на порцию с заглядыванием")
 
+    # Пауза посреди потока. Хвост звука перед ней ещё не разобран (меньше
+    # порции с заглядыванием) — его сегменты должны остаться до паузы, а
+    # всё после — сдвинуться на её длину. Раньше сдвигалось всё, что выдано
+    # после сообщения о паузе, и конец реплики переезжал на начало следующей.
+    pause_at = len(audio) / SR
     session.insert_silence(5.0)
     session.insert_audio_chunk(audio[:SR * 2])
-    shifted = []
+    after = []
     while True:
         new = await session.diarize()
         if not new:
             break
-        shifted += new
-    check(not shifted or shifted[0].start >= 5.0 + len(audio) / SR - 1.0,
-          "вырезанная тишина сдвигает время сегментов")
+        after += new
+    check(all(s.end <= pause_at + 0.01 or s.start >= pause_at + 5.0 - 0.01 for s in after),
+          "ни один сегмент не попал внутрь вырезанной паузы")
+    check(any(s.start >= pause_at + 5.0 - 0.01 for s in after),
+          "звук после паузы сдвинут на её длину")
     session.close()
 
     print("ИТОГ:", "всё верно" if not failures else f"провалов: {len(failures)}")

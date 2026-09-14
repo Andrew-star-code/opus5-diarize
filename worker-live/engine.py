@@ -563,10 +563,38 @@ class _SessionSortformer:
 
         self.stream = SortformerStream(shared_model.model)
         self.buffer_audio = None  # признак буферного бэкенда для AudioProcessor
-        self.offset = 0.0         # вырезанная тишина: время слов её включает
+        # Вырезанные паузы. Фильтр тишины не пускает их в разметку, а время
+        # слов их включает, так что время потока надо переводить в настоящее.
+        # Сдвиг привязан к месту в потоке, где была пауза, а не к моменту
+        # выдачи сегмента: о паузе сообщают, когда хвост реплики перед ней
+        # ещё не разобран, и со сдвигом «на момент выдачи» он переезжал за
+        # паузу — на первые слова следующего говорящего.
+        self._pause_at: list[float] = []     # время потока, где была пауза
+        self._shift_after: list[float] = []  # суммарный сдвиг после неё
 
     def insert_silence(self, duration: float | None) -> None:
-        self.offset += duration or 0.0
+        from sortformer_stream import SAMPLE_RATE
+
+        if not duration:
+            return
+        total = (self._shift_after[-1] if self._shift_after else 0.0) + duration
+        self._pause_at.append(self.stream.samples / SAMPLE_RATE)
+        self._shift_after.append(total)
+
+    def _real_time(self, start: float, end: float) -> list[tuple[float, float]]:
+        """Отрезок во времени потока → куски в настоящем времени, с разрывами на паузах."""
+        import bisect
+
+        i = bisect.bisect_right(self._pause_at, start)
+        shift = self._shift_after[i - 1] if i else 0.0
+        pieces = []
+        while i < len(self._pause_at) and self._pause_at[i] < end:
+            cut = self._pause_at[i]
+            pieces.append((start + shift, cut + shift))
+            start, shift = cut, self._shift_after[i]
+            i += 1
+        pieces.append((start + shift, end + shift))
+        return [(a, b) for a, b in pieces if b > a]
 
     def insert_audio_chunk(self, pcm_array) -> None:
         self.stream.push(pcm_array)
@@ -578,8 +606,9 @@ class _SessionSortformer:
 
         segments = await asyncio.to_thread(self.stream.step)
         return [
-            SpeakerSegment(speaker=speaker, start=start + self.offset, end=end + self.offset)
+            SpeakerSegment(speaker=speaker, start=a, end=b)
             for start, end, speaker in segments
+            for a, b in self._real_time(start, end)
         ]
 
     def close(self) -> None:
