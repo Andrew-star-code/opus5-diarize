@@ -28,6 +28,12 @@ PRESETS = {
                spkcache_update_period=144, spkcache_len=188),
     1.04: dict(chunk_len=6, chunk_right_context=7, fifo_len=188,
                spkcache_update_period=144, spkcache_len=188),
+    # Большие задержки — для второго прохода, который поправляет уже
+    # показанные реплики: у модели перед глазами 10–30 с продолжения.
+    10.0: dict(chunk_len=124, chunk_right_context=1, fifo_len=124,
+               spkcache_update_period=124, spkcache_len=188),
+    30.4: dict(chunk_len=340, chunk_right_context=40, fifo_len=40,
+               spkcache_update_period=300, spkcache_len=188),
 }
 
 

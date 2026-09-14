@@ -593,7 +593,10 @@ def configs_for(stage: str, args) -> list[dict]:
         # разметка или правила черновика поверх неё.
         variants = [None, dict(min_words=4), dict(snap=1), dict(min_words=4, snap=1)]
         configs = []
-        for variant, lat in (("stream0.32", 0.32), ("stream1.04", 1.04)):
+        for variant, lat in (("stream0.32", 0.32), ("stream1.04", 1.04),
+                             ("stream10.0", 10.0), ("stream30.4", 30.4)):
+            if not (SORTFORMER / variant).exists():
+                continue
             sf = dict(mode="sortformer", variant=variant, latency=lat, tau=0.0, rho=0.0, delta=0.0)
             configs += [dict(sf, smooth=v) for v in variants]
         return configs

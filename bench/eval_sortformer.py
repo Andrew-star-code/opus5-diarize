@@ -115,9 +115,12 @@ def main() -> None:
             wav = Path(tmp) / f"{sid}.wav"
             wavs[sid] = (wav, to_wav(path, wav))
 
-        for latency in (0.32, 1.04):
+        for latency in (0.32, 1.04, 10.0, 30.4):
             configure(model, latency)
-            for kind, run in (("lat", run_diarize), ("stream", run_stream)):
+            # Эталон NeMo нужен, чтобы проверить класс живого режима, — на
+            # малых задержках это сделано; на больших хватает самого класса.
+            kinds = (("lat", run_diarize), ("stream", run_stream)) if latency < 2 else (("stream", run_stream),)
+            for kind, run in kinds:
                 name = f"{kind}{latency}"
                 (OUT / name).mkdir(parents=True, exist_ok=True)
                 for sid, (wav, seconds) in wavs.items():
