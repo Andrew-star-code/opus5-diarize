@@ -602,6 +602,51 @@ def _drop_hallucinations(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text)
 
 
+_SENTENCE_END = (".", "!", "?", "…")
+
+
+def _ends_sentence(word: str) -> bool:
+    return word.rstrip("»\"')").endswith(_SENTENCE_END)
+
+
+def _snap_turns(lines: list[dict[str, Any]], max_shift: int) -> list[dict[str, Any]]:
+    """Смена говорящего посреди предложения переносится к его концу.
+
+    diart ставит границу по звуку и часто промахивается на слово: «…Шептать.
+    Надо» у одного, «всегда находить…» у другого. Если в пределах max_shift
+    слов от границы предложение кончается, граница переезжает туда —
+    сначала ищем назад, потом вперёд, как в стенде (bench/eval_live.py).
+    Время реплик не трогаем: пословного времени в репликах нет, а сдвиг
+    на слово черновику не важен.
+
+    Замер на семи записях вместе с правилом четырёх слов: 16,0% слов под
+    чужим именем вместо 16,3%, и ни одна запись не стала хуже. При сдвиге
+    на два слова в среднем чуть лучше, но две записи ухудшаются.
+    """
+    if max_shift < 1 or len(lines) < 2:
+        return lines
+    out = [dict(line) for line in lines]
+    for prev, cur in zip(out, out[1:]):
+        if prev["speaker"] == cur["speaker"]:
+            continue
+        before, after = prev["text"].split(), cur["text"].split()
+        if not before or not after or _ends_sentence(before[-1]):
+            continue
+        for d in range(1, max_shift + 1):
+            if len(before) > d and _ends_sentence(before[-1 - d]):
+                after[:0] = before[-d:]
+                del before[-d:]
+                break
+            if len(after) > d and _ends_sentence(after[d - 1]):
+                before.extend(after[:d])
+                del after[:d]
+                break
+        else:
+            continue
+        prev["text"], cur["text"] = " ".join(before), " ".join(after)
+    return out
+
+
 def _absorb_short_turns(lines: list[dict[str, Any]], min_words: int) -> list[dict[str, Any]]:
     """Обрывок короче min_words слов не может сменить говорящего.
 
@@ -671,7 +716,9 @@ def normalize(response: Any) -> dict[str, Any]:
         )
 
     return {
-        "lines": _absorb_short_turns(lines, settings.live_min_turn_words),
+        "lines": _absorb_short_turns(
+            _snap_turns(lines, settings.live_snap_words), settings.live_min_turn_words
+        ),
         # Гипотеза, которую движок ещё может переписать. Показываем её
         # серым: честнее, чем выдавать неустоявшийся текст за готовый.
         "buffer": _drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),

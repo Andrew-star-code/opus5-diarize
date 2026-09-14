@@ -228,8 +228,53 @@ class _AudioStub:
         self.data = self._Data()
 
 
+_SENTENCE_END = (".", "!", "?", "…")
+
+
+def _ends_sentence(word: list) -> bool:
+    text = word[3] if len(word) > 3 else ""
+    return text.rstrip("»\"')").endswith(_SENTENCE_END)
+
+
+def snap_to_sentence(hyp: list, words: list, max_shift: int) -> list:
+    """Граница говорящих посреди предложения переносится к его концу.
+
+    diart ставит границу по звуку и часто промахивается на слово-два:
+    «…Шептать. Надо» / «всегда находить…». Если в пределах max_shift слов
+    от границы есть конец предложения, граница переезжает туда. Переносим
+    только через слова одного говорящего — соседнюю границу не задеваем.
+    """
+    out = list(hyp)
+    n = len(out)
+    i = 1
+    while i < n:
+        if out[i] != out[i - 1] and not _ends_sentence(words[i - 1]):
+            b = i - 1  # граница — после слова b
+            best = None
+            for d in range(1, max_shift + 1):
+                for j in (b - d, b + d):
+                    if not (0 <= j < n - 1) or not _ends_sentence(words[j]):
+                        continue
+                    lo, hi, want = (j + 1, b, out[b]) if j < b else (i, j, out[i])
+                    if all(x == want for x in out[lo:hi + 1]):
+                        best = j
+                        break
+                if best is not None:
+                    break
+            if best is not None:
+                if best < b:
+                    for k in range(best + 1, b + 1):
+                        out[k] = out[i]
+                else:
+                    for k in range(i, best + 1):
+                        out[k] = out[b]
+                    i = best
+        i += 1
+    return out
+
+
 def smooth_labels(hyp: list, words: list, *, min_words: int = 0, min_sec: float = 0.0,
-                  gap: float = 0.0) -> list:
+                  gap: float = 0.0, snap: int = 0) -> list:
     """Реплика вместо слова: короткий обрывок не может сменить говорящего.
 
     Смотрит только назад, поэтому годится и для живого режима: обрывок
@@ -241,6 +286,8 @@ def smooth_labels(hyp: list, words: list, *, min_words: int = 0, min_sec: float 
         for i in range(1, len(out)):
             if out[i] != out[i - 1] and words[i][0] - words[i - 1][1] < gap:
                 out[i] = out[i - 1]
+    if snap:
+        out = snap_to_sentence(out, words, snap)
     if min_words or min_sec:
         src = list(out)
         i = 0
@@ -284,7 +331,7 @@ def word_errors(sid: str, segments: list, smooth: dict | None = None) -> dict:
     hyp = []
     if merged:
         cursor = 0
-        for s, e, _ in words:
+        for s, e, *_ in words:
             speaker, cursor = alignment._speaker_for_token(
                 ASRToken(start=s, end=e, text=" w"), merged, cursor
             )
@@ -297,7 +344,7 @@ def word_errors(sid: str, segments: list, smooth: dict | None = None) -> dict:
     ref_labels = sorted({w[2] for w in words})
     hyp_labels = sorted(set(hyp))
     counts = np.zeros((len(hyp_labels), len(ref_labels)))
-    for h, (_, _, r) in zip(hyp, words):
+    for h, (_, _, r, *_) in zip(hyp, words):
         counts[hyp_labels.index(h), ref_labels.index(r)] += 1
     rows, cols = linear_sum_assignment(-counts)
     correct = counts[rows, cols].sum()
@@ -354,6 +401,12 @@ def configs_for(stage: str, args) -> list[dict]:
         for lat in args.latency:
             configs += [dict(best, latency=lat, smooth=v) for v in variants]
         return configs
+    if stage == "snap":
+        best = dict(mode="fixed", tau=0.6, rho=0.1, delta=1.0)
+        variants = [None, dict(min_words=4)]
+        variants += [dict(snap=k) for k in (1, 2, 3)]
+        variants += [dict(snap=k, min_words=4) for k in (1, 2, 3)]
+        return [dict(best, latency=lat, smooth=v) for lat in args.latency for v in variants]
     if stage == "one":
         return [dict(mode=args.mode, latency=args.latency[0],
                      tau=args.tau, rho=args.rho, delta=args.delta)]
