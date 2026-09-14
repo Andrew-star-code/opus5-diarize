@@ -25,8 +25,15 @@ import numpy as np
 sys.path.insert(0, "/srv")  # здесь лежит код worker-live
 
 import engine  # noqa: E402
-from pyannote.core import Annotation, Segment  # noqa: E402
-from whisperlivekit.diarization.diart_backend import WebSocketAudioSource  # noqa: E402
+
+try:
+    from pyannote.core import Annotation, Segment  # noqa: E402
+    from whisperlivekit.diarization.diart_backend import WebSocketAudioSource  # noqa: E402
+except (ImportError, SystemExit):
+    # Живая диаризация теперь на Sortformer, и diart в образе нет. Проверка
+    # относится только к образу, собранному с diart.
+    print("ПРОПУСК: в образе нет diart — проверка относится только к нему")
+    raise SystemExit(0)
 
 SR = 16000
 BLOCK = 0.1

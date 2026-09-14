@@ -15,18 +15,31 @@ class Settings(BaseSettings):
     compute_type: str = "float16"
     default_language: str = "ru"
 
-    # diart | sortformer | none
-    live_diarization: str = "diart"
+    # sortformer | diart | none. diart в образе больше не стоит (numpy
+    # ниже 2 против NeMo 3); его ветка в engine.py оставлена для тех, кто
+    # соберёт образ с ним сам.
+    live_diarization: str = "sortformer"
     max_speakers: int = 8
     max_live_sessions: int = 2
 
-    # Кирпичи онлайн-диаризации. wespeaker вместо pyannote/embedding:
+    # NVIDIA Streaming Sortformer: сквозная потоковая модель, говорящие
+    # держатся в кеше в порядке появления. Не больше четырёх говорящих —
+    # остальных разберёт чистовик. Замер (bench/eval_live.py compare):
+    # путаница говорящих на AMI 3,1% против 10% у diart, на записи втроём
+    # находит всех троих.
+    live_sortformer_model: str = "nvidia/diar_streaming_sortformer_4spk-v2.1"
+    # Задержка разметки, секунды: 0.32 или 1.04 (настройки из статьи).
+    # 1.04 чуть точнее (13,3% слов под чужим именем против 14,1%), но на
+    # 0,7 с медленнее.
+    live_sortformer_latency: float = 0.32
+
+    # Кирпичи онлайн-диаризации diart. wespeaker вместо pyannote/embedding:
     # у второго отдельная лицензия, которую надо принимать вручную, а
     # при непринятой модель грузится как None и падает много позже.
     live_embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
     live_segmentation_model: str = "pyannote/segmentation-3.0"
 
-    # Настройки потоковой кластеризации diart. Подобраны замером на
+    # Настройки потоковой кластеризации diart (только для diart). Подобраны замером на
     # записях с опорной разметкой (bench/eval_live.py), значения diart по
     # умолчанию — в скобках.
     #
@@ -48,6 +61,11 @@ class Settings(BaseSettings):
     # говорящего — остаётся у предыдущего. Убирает дрожь меток на стыке
     # реплик («Но их» / «нельзя»). 1 — выключить.
     live_min_turn_words: int = 4
+    # Если граница говорящих прошла посреди предложения, а в пределах
+    # стольких слов предложение кончается, граница переезжает туда
+    # («…Шептать. Надо» / «всегда…» -> «…Шептать.» / «Надо всегда…»).
+    # 0 — выключить.
+    live_snap_words: int = 1
 
     # Отсечение тишины в потоке. Экономит GPU, но на записи с фоновой
     # музыкой или шумом принимает речь за тишину и глотает её — ровно

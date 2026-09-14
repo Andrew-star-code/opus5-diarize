@@ -16,6 +16,7 @@ from dataclasses import replace
 from typing import Any
 
 from config import settings
+from hallucinations import drop_hallucinations
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +76,9 @@ def get_engine():
             # принимает оба варианта имён сам.
             _install_session_diart()
             _patch_diart_speaker_labels()
+        if settings.diarization_enabled and settings.live_diarization == "sortformer":
+            # Своя модель порций и свой поток на запись — см. _SessionSortformer.
+            _install_session_sortformer()
         if settings.diarization_enabled:
             _patch_word_continuations()
         log.info("Загружаю live-движок: %s", kwargs)
@@ -515,6 +519,95 @@ def _patch_word_continuations() -> None:
     log.info("Говорящий в живом черновике меняется только на начале слова")
 
 
+class _SharedSortformer:
+    """Streaming Sortformer, одна модель на процесс.
+
+    Встаёт на место SortformerDiarization из WhisperLiveKit. Тот грузит
+    модель по имени через сеть и ставит свои настройки порций: порция в
+    секунду без заглядывания вперёд и subsampling 10 при кадре модели 8.
+    Здесь — локальный .nemo из кеша (сервис живёт без сети) и настройки
+    из статьи, те же, что на стенде (bench/eval_sortformer.py).
+    """
+
+    def __init__(self, model_name: str | None = None, model_path: str | None = None,
+                 **_ignored: Any) -> None:
+        import torch
+        from huggingface_hub import hf_hub_download
+        from nemo.collections.asr.models import SortformerEncLabelModel
+        from sortformer_stream import configure
+
+        repo = settings.live_sortformer_model
+        # С HF_HUB_OFFLINE=1 hf_hub_download берёт файл из кеша и в сеть не
+        # ходит; сам .nemo кладёт туда scripts/prefetch_models.py.
+        path = model_path or hf_hub_download(repo, f"{repo.rsplit('/', 1)[-1]}.nemo")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = SortformerEncLabelModel.restore_from(path, map_location=device)
+        self.model.eval()
+        configure(self.model, settings.live_sortformer_latency)
+        log.info("Sortformer готов: %s, задержка %.2f с", repo, settings.live_sortformer_latency)
+
+
+class _SessionSortformer:
+    """Диаризация одной живой записи на общей модели Sortformer.
+
+    Интерфейс — тот, что AudioProcessor ждёт от буферного бэкенда: по
+    атрибуту buffer_audio он понимает, что diarize() надо звать, пока она
+    не вернёт пусто, а сегменты — дописывать к прежним. Звук вставляется и
+    разбирается по очереди в одной сопрограмме, так что блокировка не
+    нужна; сам шаг модели уходит в поток, чтобы не держать цикл событий.
+    """
+
+    def __init__(self, shared_model: _SharedSortformer, max_speakers: int | None = None,
+                 **_ignored: Any) -> None:
+        from sortformer_stream import SortformerStream
+
+        self.stream = SortformerStream(shared_model.model)
+        self.buffer_audio = None  # признак буферного бэкенда для AudioProcessor
+        self.offset = 0.0         # вырезанная тишина: время слов её включает
+
+    def insert_silence(self, duration: float | None) -> None:
+        self.offset += duration or 0.0
+
+    def insert_audio_chunk(self, pcm_array) -> None:
+        self.stream.push(pcm_array)
+
+    async def diarize(self):
+        import asyncio
+
+        from whisperlivekit.timed_objects import SpeakerSegment
+
+        segments = await asyncio.to_thread(self.stream.step)
+        return [
+            SpeakerSegment(speaker=speaker, start=start + self.offset, end=end + self.offset)
+            for start, end, speaker in segments
+        ]
+
+    def close(self) -> None:
+        # Хвост короче порции не дожимаем: черновик после остановки
+        # всё равно заменяет чистовик.
+        self.stream = None
+
+
+def _install_session_sortformer() -> None:
+    """Подменяет Sortformer из WhisperLiveKit нашим — см. _SharedSortformer.
+
+    core.py и online_diarization_factory импортируют оба класса из модуля
+    в момент вызова, так что подмены в модуле достаточно.
+    """
+    try:
+        from whisperlivekit.diarization import sortformer_backend
+    except (Exception, SystemExit):
+        # Без NeMo модуль делает SystemExit — это тоже надо поймать.
+        log.exception("Не удалось подключить Sortformer — живая диаризация не заработает")
+        return
+    if getattr(sortformer_backend, "_scribe_session_sortformer", False):
+        return
+    sortformer_backend.SortformerDiarization = _SharedSortformer
+    sortformer_backend.SortformerDiarizationOnline = _SessionSortformer
+    sortformer_backend._scribe_session_sortformer = True
+    log.info("Sortformer: локальная модель, порции из статьи, свой поток на запись")
+
+
 def _check_names(kwargs: dict[str, Any]) -> None:
     """Сверяет имена параметров с конфигурацией установленной версии.
 
@@ -585,21 +678,49 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-# Галлюцинации Whisper на музыке и тишине: строчки из титров, на которых
-# модель обучалась. В живой речи они не встречаются, поэтому их можно
-# вырезать без риска потерять настоящие слова. Сознательно НЕ входят
-# сюда фразы вроде «Подписывайтесь» и «Спасибо за просмотр»: их говорят
-# и по-настоящему — в подкастах это обычная концовка.
-_HALLUCINATIONS = [
-    re.compile(r"Субтитры\s+\w+\s+(?:сообществом\s+)?(?:DimaTorzok|Dima\s*Torzok|Amara\.org)[.!]*", re.I),
-    re.compile(r"Редактор\s+субтитров\s+[А-ЯЁA-Z]\.\s*\w+(?:\s+Корректор\s+[А-ЯЁA-Z]\.\s*\w+)?[.!]*", re.I),
-]
+_SENTENCE_END = (".", "!", "?", "…")
 
 
-def _drop_hallucinations(text: str) -> str:
-    for pattern in _HALLUCINATIONS:
-        text = pattern.sub(" ", text)
-    return re.sub(r"\s{2,}", " ", text)
+def _ends_sentence(word: str) -> bool:
+    return word.rstrip("»\"')").endswith(_SENTENCE_END)
+
+
+def _snap_turns(lines: list[dict[str, Any]], max_shift: int) -> list[dict[str, Any]]:
+    """Смена говорящего посреди предложения переносится к его концу.
+
+    diart ставит границу по звуку и часто промахивается на слово: «…Шептать.
+    Надо» у одного, «всегда находить…» у другого. Если в пределах max_shift
+    слов от границы предложение кончается, граница переезжает туда —
+    сначала ищем назад, потом вперёд, как в стенде (bench/eval_live.py).
+    Время реплик не трогаем: пословного времени в репликах нет, а сдвиг
+    на слово черновику не важен.
+
+    Замер на семи записях вместе с правилом четырёх слов: 16,0% слов под
+    чужим именем вместо 16,3%, и ни одна запись не стала хуже. При сдвиге
+    на два слова в среднем чуть лучше, но две записи ухудшаются.
+    """
+    if max_shift < 1 or len(lines) < 2:
+        return lines
+    out = [dict(line) for line in lines]
+    for prev, cur in zip(out, out[1:]):
+        if prev["speaker"] == cur["speaker"]:
+            continue
+        before, after = prev["text"].split(), cur["text"].split()
+        if not before or not after or _ends_sentence(before[-1]):
+            continue
+        for d in range(1, max_shift + 1):
+            if len(before) > d and _ends_sentence(before[-1 - d]):
+                after[:0] = before[-d:]
+                del before[-d:]
+                break
+            if len(after) > d and _ends_sentence(after[d - 1]):
+                before.extend(after[:d])
+                del after[:d]
+                break
+        else:
+            continue
+        prev["text"], cur["text"] = " ".join(before), " ".join(after)
+    return out
 
 
 def _absorb_short_turns(lines: list[dict[str, Any]], min_words: int) -> list[dict[str, Any]]:
@@ -658,7 +779,7 @@ def normalize(response: Any) -> dict[str, Any]:
     raw_lines = _get(response, "lines") or []
     lines = []
     for line in raw_lines:
-        text = _drop_hallucinations(_get(line, "text") or "").strip()
+        text = drop_hallucinations(_get(line, "text") or "").strip()
         if not text:
             continue
         lines.append(
@@ -671,10 +792,12 @@ def normalize(response: Any) -> dict[str, Any]:
         )
 
     return {
-        "lines": _absorb_short_turns(lines, settings.live_min_turn_words),
+        "lines": _absorb_short_turns(
+            _snap_turns(lines, settings.live_snap_words), settings.live_min_turn_words
+        ),
         # Гипотеза, которую движок ещё может переписать. Показываем её
         # серым: честнее, чем выдавать неустоявшийся текст за готовый.
-        "buffer": _drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),
+        "buffer": drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),
         "buffer_speaker": (_get(response, "buffer_diarization") or "").strip(),
         "status": _get(response, "status") or "active",
         # Отставание в секундах звука: распознавания — от поступившего

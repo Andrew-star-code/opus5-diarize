@@ -124,6 +124,23 @@ def main() -> int:
     if absorb(got, 1) != got:
         failures.append("min_words=1 должен выключать правило")
 
+    # Граница на слово мимо конца предложения — так было на той же записи.
+    snap = engine._snap_turns
+    got = snap([line(a, "Шепот через «е» шептать. Шептать. Надо", 0),
+                line(b, "всегда находить вот эти слова.", 3)], 1)
+    print("подтяжка:", [l["text"] for l in got])
+    if [l["text"] for l in got] != ["Шепот через «е» шептать. Шептать.",
+                                     "Надо всегда находить вот эти слова."]:
+        failures.append(f"граница не подтянулась назад: {got}")
+    got = snap([line(a, "ну вот, да у нас", 0), line(b, "своих-то. Исконно русских слов", 3)], 1)
+    if [l["text"] for l in got] != ["ну вот, да у нас своих-то.", "Исконно русских слов"]:
+        failures.append(f"граница не подтянулась вперёд: {got}")
+    done = [line(a, "Это конец мысли.", 0), line(b, "а это начало", 2)]
+    if snap(done, 1) != done:
+        failures.append("граница на конце предложения сдвинулась")
+    if snap(got, 0) != got:
+        failures.append("max_shift=0 должен выключать подтяжку")
+
     for failure in failures:
         print("ПРОВАЛ:", failure)
     print("ИТОГ:", "всё верно" if not failures else f"провалов: {len(failures)}")

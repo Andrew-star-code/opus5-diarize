@@ -1,7 +1,7 @@
 # Тот же CUDA-базис, что у batch-воркера, но окружение отдельное:
-# diart тянет свою ветку pyannote и конфликтует с pyannote.audio 4.x,
-# который стоит в batch-образе. Разводить их по контейнерам дешевле,
-# чем воевать с резолвером зависимостей.
+# живой режим стоит на NeMo 3 (Streaming Sortformer), а batch — на
+# pyannote.audio 4.x. Разводить их по контейнерам дешевле, чем воевать
+# с резолвером зависимостей.
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -9,37 +9,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/venv/bin:$PATH
 
-# libportaudio2 нужен не нам, а diart: он безусловно импортирует
-# sounddevice ради микрофонных источников, хотя аудио мы подаём сами.
-# Без библиотеки импорт падает с "PortAudio library not found".
+# build-essential и python3.12-dev — для зависимостей NeMo, которые
+# собираются из исходников (Cython-расширения).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3.12 python3.12-venv python3-pip ffmpeg libsndfile1 libportaudio2 \
+      python3.12 python3.12-venv python3.12-dev python3-pip build-essential \
+      ffmpeg libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
-# diart официально поддерживает только Python 3.11-3.12 (ограничение numpy),
-# поэтому версия здесь зафиксирована базовым образом Ubuntu 24.04.
 RUN python3.12 -m venv /opt/venv && pip install --no-cache-dir --upgrade pip
 
-# Версии закреплены, и это не перестраховка, а необходимость.
-#
-# torchaudio: pyannote.audio 3.x, который тянет за собой diart, обращается
-# к torchaudio.AudioMetaData. В torchaudio 2.9 этот атрибут вырезали, и
-# импорт diart падает. В 2.8 он ещё есть — проверено.
-#
-# torchvision: напрямую не нужен, но его тянет diart, и с обычного PyPI
-# приезжает сборка под другую версию torch. Итог — падение на импорте
-# с загадочным "operator torchvision::nms does not exist". Поэтому берём
-# из того же индекса и той же ветки.
-#
 # 2.8 + cu128 держит sm_120 (Blackwell), так что RTX 50xx не страдает.
-RUN pip install --no-cache-dir \
-      "torch==2.8.*" "torchvision==0.23.*" "torchaudio==2.8.*" \
+RUN pip install --no-cache-dir "torch==2.8.*" "torchaudio==2.8.*" \
       --index-url https://download.pytorch.org/whl/cu128
 
 WORKDIR /srv
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# torch перечислен ещё раз, чтобы резолвер не заменил сборку cu128
+# обычной с PyPI, когда её попросит какая-нибудь зависимость NeMo.
+RUN pip install --no-cache-dir Cython packaging \
+ && pip install --no-cache-dir "torch==2.8.*" "torchaudio==2.8.*" -r requirements.txt
 
 COPY . .
 

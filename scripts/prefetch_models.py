@@ -174,6 +174,25 @@ def fetch_repo(repo: str) -> None:
         print(f"      {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+SORTFORMER = os.environ.get("LIVE_SORTFORMER_MODEL", "nvidia/diar_streaming_sortformer_4spk-v2.1")
+
+
+def fetch_sortformer(repo: str) -> None:
+    """Модель живой диаризации — один файл .nemo, без картинок из репозитория."""
+    try:
+        import nemo  # noqa: F401 — нужен только в live-контейнере
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        report(f"sortformer:{repo}", "пропуск")
+        return
+    try:
+        hf_hub_download(repo, f"{repo.rsplit('/', 1)[-1]}.nemo", token=HF_TOKEN)
+        report(f"sortformer:{repo}", "готово")
+    except Exception as exc:
+        report(f"sortformer:{repo}", "ОШИБКА")
+        print(f"      {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def main() -> int:
     if os.environ.get("HF_HUB_OFFLINE") in ("1", "true", "True"):
         print(
@@ -194,6 +213,8 @@ def main() -> int:
 
     print("\nДиаризация:")
     fetch_pyannote_pipeline(DIARIZATION)
+    # Живая диаризация; в batch-контейнере без NeMo тихо пропускается.
+    fetch_sortformer(SORTFORMER)
     for repo in DIART_MODELS:
         fetch_repo(repo)
 
