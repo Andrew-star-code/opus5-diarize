@@ -140,6 +140,7 @@ async def _run_session(ws: WebSocket) -> None:
                     "type": "transcript",
                     "lines": state["lines"],
                     "buffer": state["buffer"],
+                    "lag": state["lag"],
                     "elapsed": round(time.monotonic() - started, 2),
                 })
 

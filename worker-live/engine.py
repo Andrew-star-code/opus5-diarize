@@ -12,6 +12,7 @@ import os
 import re
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any
 
 from config import settings
@@ -74,6 +75,8 @@ def get_engine():
             # принимает оба варианта имён сам.
             _install_session_diart()
             _patch_diart_speaker_labels()
+        if settings.diarization_enabled:
+            _patch_word_continuations()
         log.info("Загружаю live-движок: %s", kwargs)
         with _trusted_checkpoints():
             _engine = TranscriptionEngine(**kwargs)
@@ -168,9 +171,146 @@ class _SharedDiartModels:
             embedding=self.embedding,
             # У diart по умолчанию 20 — берём тот же предел, что у batch.
             max_speakers=settings.max_speakers,
+            # Подобраны замером, см. комментарии в config.py.
+            latency=settings.live_diar_latency,
+            tau_active=settings.live_diar_tau_active,
+            rho_update=settings.live_diar_rho_update,
+            delta_new=settings.live_diar_delta_new,
             device=self.device,
             sample_rate=self.sample_rate,
         )
+
+
+class _SegmentsObserver:
+    """Собирает разметку diart в сегменты для выравнивания WhisperLiveKit.
+
+    Замена DiarizationObserver из WhisperLiveKit, у которого два изъяна:
+
+    - границы реплик он берёт из плоского списка попарно, так что пауза
+      между двумя кусками речи одного говорящего тоже засчитывается ему;
+    - сегменты складываются по говорящим, а не по времени, а выравнивание
+      идёт по ним курсором, который считает список упорядоченным, — и на
+      смене говорящих может проскочить нужный сегмент.
+
+    Здесь сегменты идут строго по времени, а соседние куски одного
+    говорящего склеиваются. Заодно список остаётся коротким — по сегменту
+    на реплику, а не на каждые полсекунды, — и его копирование на каждом
+    обновлении не дорожает к концу долгой записи.
+    """
+
+    _GAP = 0.05  # щель между шагами diart, которую не считаем паузой
+
+    def __init__(self) -> None:
+        from whisperlivekit.timed_objects import SpeakerSegment
+
+        self._segment_cls = SpeakerSegment
+        self._segments: list = []
+        self._lock = threading.Lock()
+        self.global_time_offset = 0.0
+        self.processed_time = 0.0
+
+    def on_next(self, value) -> None:
+        annotation, audio = value
+        tracks = sorted(annotation.itertracks(yield_label=True), key=lambda item: item[0].start)
+        with self._lock:
+            self.processed_time = max(self.processed_time, audio.extent.end)
+            for segment, _track, label in tracks:
+                speaker = _speaker_index(label)
+                start = segment.start + self.global_time_offset
+                end = segment.end + self.global_time_offset
+                last = self._segments[-1] if self._segments else None
+                if last is not None and last.speaker == speaker and start <= last.end + self._GAP:
+                    last.end = max(last.end, end)
+                else:
+                    self._segments.append(self._segment_cls(start=start, end=end, speaker=speaker))
+
+    def on_error(self, error) -> None:
+        log.error("Ошибка в потоке diart: %s", error)
+
+    def on_completed(self) -> None:
+        pass
+
+    def get_segments(self) -> list:
+        # Копии: последний сегмент ещё растёт в потоке diart.
+        with self._lock:
+            return [replace(segment) for segment in self._segments]
+
+
+def _speaker_index(label: Any) -> int:
+    """«speaker3» от diart -> 3; выравнивание WhisperLiveKit ждёт число."""
+    if isinstance(label, int):
+        return label
+    digits = re.sub(r"\D", "", str(label))
+    return int(digits) if digits else 0
+
+
+_REALTIME_SOURCE = None
+
+
+def _realtime_source_class():
+    """Источник звука для diart без искусственного торможения.
+
+    WebSocketAudioSource из WhisperLiveKit перед каждым блоком досыпает до
+    длительности блока, отсчитывая время от конца обработки предыдущего.
+    Выходит, что на каждый шаг diart уходит время звука плюс время работы
+    моделей, и разметка отстаёт всё сильнее: по замеру на 5,5 с к полутора
+    минутам записи, и отставание не рассасывается. Пока разметка не
+    покрыла слово, WhisperLiveKit держит его серой гипотезой — текст
+    «застывал» тем сильнее, чем дольше шла запись. Живой звук и так
+    приходит с реальной скоростью, тормозить его незачем.
+
+    Второе отличие: неполный блок не добивается нулями посреди записи.
+    Порции от WhisperLiveKit произвольной длины, и на каждой паузе между
+    ними исходный источник вставлял тишину, которой не было, — время diart
+    уходило вперёд времени слов. Остаток дожидается следующей порции, а
+    нулями дополняется только в самом конце записи.
+    """
+    global _REALTIME_SOURCE
+    if _REALTIME_SOURCE is not None:
+        return _REALTIME_SOURCE
+
+    from queue import Empty
+
+    import numpy as np
+    from whisperlivekit.diarization.diart_backend import WebSocketAudioSource
+
+    class RealtimeAudioSource(WebSocketAudioSource):
+        def _process_chunks(self) -> None:
+            try:
+                while not self._closed:
+                    try:
+                        chunk = self._queue.get(timeout=0.1)
+                    except Empty:
+                        continue
+                    self._emit(chunk)
+                # Хвост: всё, что успело прийти до закрытия, и неполный блок.
+                while True:
+                    try:
+                        self._emit(self._queue.get_nowait())
+                    except Empty:
+                        break
+                with self._buffer_lock:
+                    if len(self._buffer):
+                        padded = np.zeros(self.block_size, dtype=np.float32)
+                        padded[:len(self._buffer)] = self._buffer
+                        self._buffer = np.array([], dtype=np.float32)
+                        self.stream.on_next(padded.reshape(1, -1))
+            except Exception as exc:
+                log.exception("Источник звука diart остановился с ошибкой")
+                self.stream.on_error(exc)
+                return
+            self.stream.on_completed()
+
+        def _emit(self, chunk) -> None:
+            with self._buffer_lock:
+                self._buffer = np.concatenate([self._buffer, chunk])
+                while len(self._buffer) >= self.block_size:
+                    block = self._buffer[:self.block_size]
+                    self._buffer = self._buffer[self.block_size:]
+                    self.stream.on_next(block.reshape(1, -1))
+
+    _REALTIME_SOURCE = RealtimeAudioSource
+    return _REALTIME_SOURCE
 
 
 class _SessionDiart:
@@ -184,13 +324,9 @@ class _SessionDiart:
     def __init__(self, shared: _SharedDiartModels) -> None:
         from diart import SpeakerDiarization
         from diart.inference import StreamingInference
-        from whisperlivekit.diarization.diart_backend import (
-            DiarizationObserver,
-            WebSocketAudioSource,
-        )
 
-        self.observer = DiarizationObserver()
-        self.source = WebSocketAudioSource(
+        self.observer = _SegmentsObserver()
+        self.source = _realtime_source_class()(
             uri="scribe-live",
             sample_rate=shared.sample_rate,
             block_duration=shared.block_duration,
@@ -339,6 +475,46 @@ def _patch_diart_speaker_labels() -> None:
                 "ожидает их в разном виде в разных местах")
 
 
+def _patch_word_continuations() -> None:
+    """Не даёт говорящему смениться посреди слова в живом черновике.
+
+    SimulStreaming режет речь на порции, и слово на стыке порций приходит
+    двумя токенами: начало с ведущим пробелом (« Ск»), продолжение без
+    него («анируем»). Выравнивание WhisperLiveKit назначает говорящего
+    каждому токену отдельно, и если граница diart легла между кусками,
+    слово разрывается между двумя репликами: «Ск» у одного говорящего,
+    «анируем» у другого.
+
+    В апстриме уже есть ровно такой случай: одиночный знак препинания
+    всегда уходит к текущему говорящему, чтобы не плодить реплики из
+    одной точки. Эта проверка вызывается только в том месте обхода, и
+    мы расширяем её на продолжения слов. Новое слово Whisper всегда
+    выдаёт с пробелом, поэтому целые слова не прилипают к чужой реплике.
+    """
+    try:
+        from whisperlivekit.tokens_alignment import TokensAlignment
+    except Exception:
+        log.exception("Не удалось подключить склейку слов — в живом "
+                      "черновике слова могут рваться между говорящими")
+        return
+
+    original = getattr(TokensAlignment, "_is_punctuation_only", None)
+    if original is None:
+        log.error("В WhisperLiveKit нет _is_punctuation_only — склейка слов "
+                  "не подключена, проверьте версию")
+        return
+    if getattr(original, "_scribe_patched", False):
+        return
+
+    def stays_with_previous(token) -> bool:
+        text = getattr(token, "text", "") or ""
+        return original(token) or (bool(text) and not text[0].isspace())
+
+    stays_with_previous._scribe_patched = True
+    TokensAlignment._is_punctuation_only = staticmethod(stays_with_previous)
+    log.info("Говорящий в живом черновике меняется только на начале слова")
+
+
 def _check_names(kwargs: dict[str, Any]) -> None:
     """Сверяет имена параметров с конфигурацией установленной версии.
 
@@ -409,12 +585,80 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+# Галлюцинации Whisper на музыке и тишине: строчки из титров, на которых
+# модель обучалась. В живой речи они не встречаются, поэтому их можно
+# вырезать без риска потерять настоящие слова. Сознательно НЕ входят
+# сюда фразы вроде «Подписывайтесь» и «Спасибо за просмотр»: их говорят
+# и по-настоящему — в подкастах это обычная концовка.
+_HALLUCINATIONS = [
+    re.compile(r"Субтитры\s+\w+\s+(?:сообществом\s+)?(?:DimaTorzok|Dima\s*Torzok|Amara\.org)[.!]*", re.I),
+    re.compile(r"Редактор\s+субтитров\s+[А-ЯЁA-Z]\.\s*\w+(?:\s+Корректор\s+[А-ЯЁA-Z]\.\s*\w+)?[.!]*", re.I),
+]
+
+
+def _drop_hallucinations(text: str) -> str:
+    for pattern in _HALLUCINATIONS:
+        text = pattern.sub(" ", text)
+    return re.sub(r"\s{2,}", " ", text)
+
+
+def _absorb_short_turns(lines: list[dict[str, Any]], min_words: int) -> list[dict[str, Any]]:
+    """Обрывок короче min_words слов не может сменить говорящего.
+
+    diart решает «кто говорит» каждые полсекунды по звуку, и на стыке
+    реплик метка дрожит: «Но их» у одного, «нельзя» у другого, дальше
+    снова первый. Коммерческие системы (AssemblyAI) решают по реплике
+    целиком, а обрывку короче секунды своего говорящего не дают. Здесь
+    так же: подряд идущие реплики одного говорящего — одна серия, и если
+    в серии меньше min_words слов, она остаётся у предыдущего говорящего
+    и приклеивается к его реплике.
+
+    Смотрим только назад, поэтому годится для живого режима: пока новый
+    человек сказал меньше min_words слов, они идут под предыдущим, а
+    когда реплика выросла — становятся отдельной. Замер (bench/eval_live.py,
+    семь записей): обрывков короче трёх слов 2 вместо 140, слов под чужим
+    именем 16,3% вместо 18,1%. Цена — настоящий ответ в пару слов («Да,
+    конечно») попадает к собеседнику.
+    """
+    if min_words <= 1 or len(lines) < 2:
+        return lines
+
+    series: list[list[dict[str, Any]]] = []
+    for line in lines:
+        if series and series[-1][0]["speaker"] == line["speaker"]:
+            series[-1].append(line)
+        else:
+            series.append([line])
+
+    out: list[dict[str, Any]] = []
+    glued = False  # к последней реплике только что приклеен чужой обрывок
+    for run in series:
+        words = sum(len(line["text"].split()) for line in run)
+        if out and words < min_words:
+            for line in run:
+                _glue(out[-1], line)
+            glued = True
+            continue
+        run = [dict(line) for line in run]
+        if glued and out[-1]["speaker"] == run[0]["speaker"]:
+            # «А, обрывок Б, снова А» — это одна реплика А.
+            _glue(out[-1], run.pop(0))
+        out.extend(run)
+        glued = False
+    return out
+
+
+def _glue(target: dict[str, Any], line: dict[str, Any]) -> None:
+    target["text"] = f"{target['text']} {line['text']}"
+    target["end"] = max(target["end"], line["end"])
+
+
 def normalize(response: Any) -> dict[str, Any]:
     """Приводит ответ движка к формату, который понимает наш фронтенд."""
     raw_lines = _get(response, "lines") or []
     lines = []
     for line in raw_lines:
-        text = (_get(line, "text") or "").strip()
+        text = _drop_hallucinations(_get(line, "text") or "").strip()
         if not text:
             continue
         lines.append(
@@ -427,12 +671,19 @@ def normalize(response: Any) -> dict[str, Any]:
         )
 
     return {
-        "lines": lines,
+        "lines": _absorb_short_turns(lines, settings.live_min_turn_words),
         # Гипотеза, которую движок ещё может переписать. Показываем её
         # серым: честнее, чем выдавать неустоявшийся текст за готовый.
-        "buffer": (_get(response, "buffer_transcription") or "").strip(),
+        "buffer": _drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),
         "buffer_speaker": (_get(response, "buffer_diarization") or "").strip(),
         "status": _get(response, "status") or "active",
+        # Отставание в секундах звука: распознавания — от поступившего
+        # звука, разметки говорящих — от распознанного текста. Пока
+        # разметка не догнала слово, оно висит серой гипотезой.
+        "lag": {
+            "asr": _seconds(_get(response, "remaining_time_transcription")),
+            "diarization": _seconds(_get(response, "remaining_time_diarization")),
+        },
     }
 
 
