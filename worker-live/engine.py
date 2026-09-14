@@ -16,6 +16,7 @@ from dataclasses import replace
 from typing import Any
 
 from config import settings
+from hallucinations import drop_hallucinations
 
 log = logging.getLogger(__name__)
 
@@ -677,23 +678,6 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-# Галлюцинации Whisper на музыке и тишине: строчки из титров, на которых
-# модель обучалась. В живой речи они не встречаются, поэтому их можно
-# вырезать без риска потерять настоящие слова. Сознательно НЕ входят
-# сюда фразы вроде «Подписывайтесь» и «Спасибо за просмотр»: их говорят
-# и по-настоящему — в подкастах это обычная концовка.
-_HALLUCINATIONS = [
-    re.compile(r"Субтитры\s+\w+\s+(?:сообществом\s+)?(?:DimaTorzok|Dima\s*Torzok|Amara\.org)[.!]*", re.I),
-    re.compile(r"Редактор\s+субтитров\s+[А-ЯЁA-Z]\.\s*\w+(?:\s+Корректор\s+[А-ЯЁA-Z]\.\s*\w+)?[.!]*", re.I),
-]
-
-
-def _drop_hallucinations(text: str) -> str:
-    for pattern in _HALLUCINATIONS:
-        text = pattern.sub(" ", text)
-    return re.sub(r"\s{2,}", " ", text)
-
-
 _SENTENCE_END = (".", "!", "?", "…")
 
 
@@ -795,7 +779,7 @@ def normalize(response: Any) -> dict[str, Any]:
     raw_lines = _get(response, "lines") or []
     lines = []
     for line in raw_lines:
-        text = _drop_hallucinations(_get(line, "text") or "").strip()
+        text = drop_hallucinations(_get(line, "text") or "").strip()
         if not text:
             continue
         lines.append(
@@ -813,7 +797,7 @@ def normalize(response: Any) -> dict[str, Any]:
         ),
         # Гипотеза, которую движок ещё может переписать. Показываем её
         # серым: честнее, чем выдавать неустоявшийся текст за готовый.
-        "buffer": _drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),
+        "buffer": drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),
         "buffer_speaker": (_get(response, "buffer_diarization") or "").strip(),
         "status": _get(response, "status") or "active",
         # Отставание в секундах звука: распознавания — от поступившего

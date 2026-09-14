@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from config import settings
+from hallucinations import drop_hallucinations, hallucinated_words
 from merge import Segment, Word
 
 log = logging.getLogger(__name__)
@@ -122,17 +123,28 @@ def transcribe(
     words: list[Word] = []
     asr_segments: list[Segment] = []
 
+    dropped = 0
     for seg in segments_iter:
-        asr_segments.append(
-            Segment(start=seg.start, end=seg.end, speaker=None, text=seg.text.strip())
-        )
-        for w in (seg.words or []):
-            text = w.word.strip()
-            if text:
-                words.append(Word(w=text, s=w.start, e=w.end,
-                                  p=round(float(w.probability or 1.0), 3)))
+        seg_words = [
+            Word(w=w.word.strip(), s=w.start, e=w.end, p=round(float(w.probability or 1.0), 3))
+            for w in (seg.words or []) if w.word.strip()
+        ]
+        text = seg.text.strip()
+        if settings.drop_hallucinations:
+            # Строчки из титров, которые Whisper выдумывает на музыке и
+            # тишине («Субтитры сделал DimaTorzok»), — см. hallucinations.py.
+            # Слова уходят вместе с таймингами, до разметки говорящих.
+            marks = hallucinated_words([w.w for w in seg_words])
+            dropped += sum(marks)
+            seg_words = [w for w, bad in zip(seg_words, marks) if not bad]
+            text = drop_hallucinations(text).strip()
+        if text:
+            asr_segments.append(Segment(start=seg.start, end=seg.end, speaker=None, text=text))
+        words.extend(seg_words)
         if on_progress and duration > 0:
             on_progress(min(1.0, seg.end / duration))
+    if dropped:
+        log.info("ASR: выброшено %d слов из строчек титров", dropped)
 
     detected = getattr(info, "language", None) or lang or "unknown"
     log.info("ASR: %d слов, %d фраз, язык=%s", len(words), len(asr_segments), detected)
