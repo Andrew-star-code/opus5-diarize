@@ -41,6 +41,8 @@ docker compose run --rm --no-deps -v "$(pwd)/bench:/bench" worker-batch python -
 | `eval_round2.py` | Слияние лишних говорящих по сетке порогов, сглаживание по частям, источник меток для слов |
 | `eval_round3.py` | Итог: как было и как стало, по production-коду |
 | `eval_live.py` | Живая диаризация (diart): настройки кластеризации, задержка, способ собирать разметку в сегменты |
+| `eval_sortformer.py` | Прогон NVIDIA Streaming Sortformer по тем же записям — для сравнения с diart в `eval_live.py compare` |
+| `eval_asr.py` | Распознавание русского: Whisper large-v3 (как в чистовике) против GigaAM-v3 |
 
 ## Живая диаризация
 
@@ -81,3 +83,87 @@ docker compose run --rm --no-deps -v "$(pwd)/bench:/bench" worker-live python -u
 в черновике против чистовика и сколько из них обрывки короче трёх слов.
 Одной доли ошибок мало — настройка может снизить её и при этом
 раздробить текст так, что его невозможно читать.
+
+Встречи AMI из `bench/data` (после `fetch_ami.sh`) попадают в `eval_live.py`
+автоматически: для них считается строгий DER против разметки, сделанной
+людьми, — без воротника вокруг границ и с учётом перекрытий, как в
+опубликованных замерах. Правила сглаживания работают со словами и на DER
+не влияют.
+
+## Streaming Sortformer
+
+Сквозная потоковая модель диаризации NVIDIA (2025): звук идёт порциями,
+говорящие держатся в кеше в порядке появления. Её советует сам
+WhisperLiveKit вместо diart. NeMo несовместим с diart (numpy), поэтому
+у неё отдельный образ:
+
+```bash
+docker build -t scribe-bench-sortformer bench/sortformer
+```
+
+```bash
+docker run --rm --gpus all -v "$(pwd)/bench:/bench" -v "$(pwd)/data:/data" -v "$(pwd)/models:/models" -v "$(pwd)/worker-live:/live" -e HF_HOME=/models scribe-bench-sortformer python -u /bench/eval_sortformer.py
+```
+
+Сегменты складываются в `bench/cache/sortformer/`: `lat*` — эталонный
+потоковый прогон NeMo (`diarize()`), `stream*` — класс живого режима
+`worker-live/sortformer_stream.py` на том же звуке кусками по 0,1 с. Для
+второго в контейнер монтируется код воркера: `-v "$(pwd)/worker-live:/live"`.
+По кадрам они совпадают на 99,9–100%.
+
+Считает их `eval_live.py eval compare` — тем же выравниванием и
+сглаживанием, что и diart. В штатном образе worker-live нет
+`pyannote.metrics` (он нужен для DER на AMI) — его ставим на время
+прогона:
+
+```bash
+docker compose run --rm --no-deps -v "$(pwd)/bench:/bench" worker-live sh -c 'pip install -q "pyannote.metrics==3.2.*" && python -u /bench/eval_live.py eval compare'
+```
+
+Строки diart в этом образе пропускаются: diart из него убран (numpy
+ниже 2 против NeMo 3). Этапы `cache`, `variants`, `grid`, `smooth`,
+`snap`, `phantom` для diart требуют образа с ним — его можно собрать из
+коммита до перехода на Sortformer. Последние результаты diart рядом с
+Sortformer сохранены в `bench/cache/live_results_compare_diart.jsonl`.
+
+## Распознавание русского
+
+`eval_asr.py` сравнивает Whisper large-v3 (кодом самого batch-воркера,
+ровно как в чистовике) с GigaAM-v3 в двух вариантах: с пунктуацией и
+без. Наборы:
+
+- **Golos farfield** — дальний микрофон, 1916 фраз. GigaAM учили в том
+  числе на Golos, так что ему здесь проще;
+- **FLEURS ru** — чтение фраз из Википедии; ни одна модель его не видела.
+
+Метрики — доля ошибок в словах (WER) и буквах (CER) после приведения к
+одному виду: нижний регистр, ё → е, цифры словами, без пунктуации.
+Наборы скачиваются в `bench/data/asr/` (Golos — parquet с Hugging Face,
+FLEURS — `data/ru_ru` из `google/fleurs`). Образ — batch-воркер плюс
+GigaAM:
+
+```bash
+docker build -t scribe-bench-asr bench/asr
+```
+
+```bash
+docker run --rm --gpus all -v "$(pwd)/bench:/bench" -v "$(pwd)/models:/models" -e HF_HOME=/models scribe-bench-asr python -u /bench/eval_asr.py
+```
+
+### Результат
+
+| | Golos (дальний микрофон) | FLEURS (чтение) |
+|---|---|---|
+| Whisper large-v3 (как в чистовике) | 16,1% | **4,0%** |
+| GigaAM-v3 с пунктуацией | **5,9%** | 4,5% |
+
+Доля ошибок в словах. На нейтральном FLEURS Whisper не хуже. Выигрыш
+GigaAM на Golos во многом объясняется данными: это команды голосовому
+помощнику («Салют», «Джой», «Афина…»), на которых GigaAM учили. Вторая
+причина — галлюцинации Whisper на коротких шумных фразах: вместо команды
+он пишет «Субтитры сделал DimaTorzok» или «Редактор субтитров…». Такие
+строчки уже вырезаются из живого черновика.
+
+Менять распознавание в чистовике эти данные повода не дают. Вариант
+GigaAM без пунктуации (`v3_rnnt`) в сравнение не вошёл: его файл дважды
+скачивался с сервера не целиком и не проходил контрольную сумму.

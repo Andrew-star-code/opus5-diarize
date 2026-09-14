@@ -51,6 +51,30 @@ UNTRUSTED = {"aecbc57332104826"}
 
 DEFAULTS = dict(tau=0.6, rho=0.3, delta=1.0)  # значения diart по умолчанию
 
+# Встречи AMI (bench/fetch_ami.sh): эталон размечен людьми, а не нашим же
+# чистовиком. Слов в эталоне нет — меряется DER по времени.
+AMI = Path("/bench/data")
+SORTFORMER = Path("/bench/cache/sortformer")
+
+
+def ami_refs() -> dict:
+    return {
+        wav.stem: {"audio": str(wav), "rttm": str(wav.with_suffix(".rttm")), "words": []}
+        for wav in sorted(AMI.glob("*.wav")) if wav.with_suffix(".rttm").exists()
+    }
+
+
+def load_rttm(path: str):
+    from pyannote.core import Annotation, Segment
+
+    ann = Annotation()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) >= 8 and parts[0] == "SPEAKER":
+            start, dur = float(parts[3]), float(parts[4])
+            ann[Segment(start, start + dur)] = parts[7]
+    return ann
+
 
 # --------------------------------------------------------------- этап 1
 
@@ -165,13 +189,23 @@ def _load_files(names: list[str], refs: dict) -> None:
             "seg": data["seg"], "emb": torch.from_numpy(data["emb"]),
             "starts": data["starts"], "duration": float(data["duration"]),
             "step": float(data["step"]), "max_speakers": int(data["max_speakers"]),
-            "words": refs[sid]["words"],
+            "words": refs[sid].get("words", []),
+            "ref": load_rttm(refs[sid]["rttm"]) if refs[sid].get("rttm") else None,
         }
 
 
 def simulate(sid: str, *, latency: float, tau: float, rho: float, delta: float,
-             mode: str) -> list:
-    """Прогоняет кластеризацию и склейку diart по кешу; сегменты как в живом режиме."""
+             mode: str, variant: str | None = None) -> list:
+    """Прогоняет кластеризацию и склейку diart по кешу; сегменты как в живом режиме.
+
+    mode="sortformer" — готовые сегменты Streaming Sortformer из кеша
+    eval_sortformer.py (variant — настройка задержки).
+    """
+    if mode == "sortformer":
+        path = SORTFORMER / variant / f"{sid}.json"
+        if not path.exists():
+            raise SystemExit(f"нет сегментов Sortformer: {path} — сначала eval_sortformer.py")
+        return [s for s in json.loads(path.read_text(encoding="utf-8"))["segments"] if s[1] > s[0]]
     from diart.blocks import Binarize, DelayedAggregation, OnlineSpeakerClustering
     from pyannote.core import SlidingWindow, SlidingWindowFeature
 
@@ -273,15 +307,36 @@ def snap_to_sentence(hyp: list, words: list, max_shift: int) -> list:
     return out
 
 
+def establish_speakers(hyp: list, min_words: int) -> list:
+    """Новый говорящий появляется, только когда наговорил min_words слов.
+
+    Sortformer иногда заводит лишнего говорящего на разговоре вдвоём —
+    на пару фраз. Строго онлайн: пока у метки меньше min_words слов с
+    начала записи, её слова остаются у последнего настоящего говорящего.
+    Первый говорящий записи настоящий сразу.
+    """
+    out = list(hyp)
+    counts, visible, last = {}, set(), None
+    for i, label in enumerate(hyp):
+        counts[label] = counts.get(label, 0) + 1
+        if last is None or counts[label] >= min_words:
+            visible.add(label)
+        if label in visible:
+            last = label
+        else:
+            out[i] = last
+    return out
+
+
 def smooth_labels(hyp: list, words: list, *, min_words: int = 0, min_sec: float = 0.0,
-                  gap: float = 0.0, snap: int = 0) -> list:
+                  gap: float = 0.0, snap: int = 0, establish: int = 0) -> list:
     """Реплика вместо слова: короткий обрывок не может сменить говорящего.
 
     Смотрит только назад, поэтому годится и для живого режима: обрывок
     остаётся у предыдущего говорящего. gap — смена говорящего допустима
     только на паузе не короче gap секунд.
     """
-    out = list(hyp)
+    out = establish_speakers(hyp, establish) if establish else list(hyp)
     if gap > 0:
         for i in range(1, len(out)):
             if out[i] != out[i - 1] and words[i][0] - words[i - 1][1] < gap:
@@ -362,13 +417,34 @@ def word_errors(sid: str, segments: list, smooth: dict | None = None) -> dict:
     }
 
 
+def ami_score(sid: str, segments: list) -> dict:
+    """Строгий DER, как в опубликованных замерах: без воротника, с перекрытиями."""
+    from pyannote.core import Annotation, Segment
+    from pyannote.metrics.diarization import DiarizationErrorRate
+
+    hyp = Annotation()
+    for start, end, speaker in segments:
+        hyp[Segment(start, end)] = f"spk{speaker}"
+    ref = _FILES[sid]["ref"]
+    d = DiarizationErrorRate(collar=0.0, skip_overlap=False)(ref, hyp, detailed=True)
+    total = d["total"] or 1.0
+    return {"der": d["diarization error rate"], "conf": d["confusion"] / total,
+            "spk": len(hyp.labels()), "ref_spk": len(ref.labels())}
+
+
 def evaluate(config: dict) -> dict:
     result = {"config": config, "files": {}}
     params = {k: v for k, v in config.items() if k != "smooth"}
     for sid in _FILES:
         segments = simulate(sid, **params)
-        result["files"][sid] = word_errors(sid, segments, config.get("smooth"))
-    trusted = {k: v for k, v in result["files"].items() if k not in UNTRUSTED}
+        if _FILES[sid]["ref"] is not None:
+            result["files"][sid] = ami_score(sid, segments)
+        else:
+            result["files"][sid] = word_errors(sid, segments, config.get("smooth"))
+    ami = [v for v in result["files"].values() if "der" in v]
+    result["der"] = float(np.mean([v["der"] for v in ami])) if ami else float("nan")
+    result["conf"] = float(np.mean([v["conf"] for v in ami])) if ami else float("nan")
+    trusted = {k: v for k, v in result["files"].items() if k not in UNTRUSTED and "der" not in v}
     result["mean"] = float(np.mean([v["err"] for v in trusted.values()]))
     result["worst"] = float(np.max([v["err"] for v in trusted.values()]))
     result["turns"] = sum(v["turns"] for v in trusted.values())
@@ -407,6 +483,35 @@ def configs_for(stage: str, args) -> list[dict]:
         variants += [dict(snap=k) for k in (1, 2, 3)]
         variants += [dict(snap=k, min_words=4) for k in (1, 2, 3)]
         return [dict(best, latency=lat, smooth=v) for lat in args.latency for v in variants]
+    if stage == "compare":
+        best = dict(mode="fixed", tau=0.6, rho=0.1, delta=1.0)
+        live = dict(min_words=4, snap=1)  # правила нынешнего живого режима
+        configs = []
+        try:
+            import diart  # noqa: F401
+        except ImportError:
+            # В штатном образе worker-live diart больше нет (NeMo 3 требует
+            # numpy 2) — считаем только Sortformer.
+            print("diart не установлен — его строки пропускаются", flush=True)
+        else:
+            configs += [dict(mode="wlk", latency=0.5, **DEFAULTS),
+                        dict(best, latency=0.5), dict(best, latency=0.5, smooth=live),
+                        dict(best, latency=1.0, smooth=live)]
+        # lat* — эталонный потоковый прогон NeMo, stream* — наш класс
+        # живого режима на том же звуке; они должны совпасть.
+        for variant, lat in (("lat0.32", 0.32), ("stream0.32", 0.32),
+                             ("lat1.04", 1.04), ("stream1.04", 1.04)):
+            if (SORTFORMER / variant).exists():
+                sf = dict(mode="sortformer", variant=variant, latency=lat, tau=0.0, rho=0.0, delta=0.0)
+                configs += [sf, dict(sf, smooth=live)]
+        return configs
+    if stage == "phantom":
+        live = dict(min_words=4, snap=1)
+        bases = [dict(mode="fixed", tau=0.6, rho=0.1, delta=1.0, latency=0.5)]
+        for variant, lat in (("lat0.32", 0.32), ("lat1.04", 1.04)):
+            bases.append(dict(mode="sortformer", variant=variant, latency=lat, tau=0.0, rho=0.0, delta=0.0))
+        return [dict(b, smooth=dict(live, **({"establish": n} if n else {})))
+                for b in bases for n in (0, 10, 20, 40)]
     if stage == "one":
         return [dict(mode=args.mode, latency=args.latency[0],
                      tau=args.tau, rho=args.rho, delta=args.delta)]
@@ -433,21 +538,23 @@ def run_eval(refs: dict, args) -> None:
 
     results.sort(key=lambda r: r["mean"])
     header = (f"{'режим':9} {'задерж':>6} {'tau':>4} {'rho':>4} {'delta':>5} {'сглаживание':>22} │ "
-              f"{'среднее':>7} {'худшее':>6} {'реплик':>9} {'обрывков':>8} │ ")
+              f"{'среднее':>7} {'худшее':>6} {'реплик':>9} {'обрывков':>8} {'DER AMI':>7} │ ")
     header += " ".join(f"{short(s):>11}" for s in names)
     print(header)
     print("─" * len(header))
     for r in results[: args.top]:
         c = r["config"]
         cells = " ".join(
-            f"{r['files'][s]['err'] * 100:5.1f}% {r['files'][s]['spk']}/{r['files'][s]['ref_spk']}"
+            f"{r['files'][s].get('der', r['files'][s].get('err', 0)) * 100:5.1f}% "
+            f"{r['files'][s]['spk']}/{r['files'][s]['ref_spk']}"
             for s in names
         )
         sm = ",".join(f"{k}={v}" for k, v in (c.get("smooth") or {}).items()) or "—"
-        print(f"{c['mode']:9} {c['latency']:6.1f} {c['tau']:4.2f} {c['rho']:4.2f} {c['delta']:5.2f} {sm:>22} │ "
+        label = c.get("variant") or c["mode"]
+        print(f"{label:10} {c['latency']:5.2f} {c['tau']:4.2f} {c['rho']:4.2f} {c['delta']:5.2f} {sm:>22} │ "
               f"{r['mean'] * 100:6.1f}% {r['worst'] * 100:5.1f}% {r['turns']:4d}/{r['ref_turns']:<4d} "
-              f"{r['scraps']:8d} │ {cells}")
-    print("\nв ячейке: доля слов под чужим именем, найдено говорящих / в чистовике;"
+              f"{r['scraps']:8d} {r['der'] * 100:6.1f}% │ {cells}")
+    print("\nв ячейке: доля слов под чужим именем (для встреч AMI — DER), найдено говорящих / в эталоне;"
           " * — чистовик ненадёжен, в среднее не входит;\n"
           "реплик — в черновике / в чистовике, обрывков — реплик короче трёх слов (без *)")
 
@@ -470,6 +577,7 @@ def main() -> None:
     args = parser.parse_args()
 
     refs = json.loads(REFS.read_text(encoding="utf-8"))
+    refs.update(ami_refs())
     if args.what == "cache":
         build_cache(refs)
     else:
