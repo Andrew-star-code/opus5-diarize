@@ -195,7 +195,7 @@ def _load_files(names: list[str], refs: dict) -> None:
 
 
 def simulate(sid: str, *, latency: float, tau: float, rho: float, delta: float,
-             mode: str, variant: str | None = None) -> list:
+             mode: str, variant: str | None = None, shift: float = 0.0) -> list:
     """Прогоняет кластеризацию и склейку diart по кешу; сегменты как в живом режиме.
 
     mode="sortformer" — готовые сегменты Streaming Sortformer из кеша
@@ -205,7 +205,10 @@ def simulate(sid: str, *, latency: float, tau: float, rho: float, delta: float,
         path = SORTFORMER / variant / f"{sid}.json"
         if not path.exists():
             raise SystemExit(f"нет сегментов Sortformer: {path} — сначала eval_sortformer.py")
-        return [s for s in json.loads(path.read_text(encoding="utf-8"))["segments"] if s[1] > s[0]]
+        # shift — сдвиг разметки раньше на столько секунд: проверка, не
+        # запаздывает ли модель относительно звука.
+        segs = json.loads(path.read_text(encoding="utf-8"))["segments"]
+        return [[max(0.0, s - shift), e - shift, spk] for s, e, spk in segs if e - shift > max(0.0, s - shift)]
     from diart.blocks import Binarize, DelayedAggregation, OnlineSpeakerClustering
     from pyannote.core import SlidingWindow, SlidingWindowFeature
 
@@ -329,7 +332,8 @@ def establish_speakers(hyp: list, min_words: int) -> list:
 
 
 def smooth_labels(hyp: list, words: list, *, min_words: int = 0, min_sec: float = 0.0,
-                  gap: float = 0.0, snap: int = 0, establish: int = 0) -> list:
+                  gap: float = 0.0, snap: int = 0, establish: int = 0,
+                  lookahead: bool = False) -> list:
     """Реплика вместо слова: короткий обрывок не может сменить говорящего.
 
     Смотрит только назад, поэтому годится и для живого режима: обрывок
@@ -343,6 +347,8 @@ def smooth_labels(hyp: list, words: list, *, min_words: int = 0, min_sec: float 
                 out[i] = out[i - 1]
     if snap:
         out = snap_to_sentence(out, words, snap)
+    if (min_words or min_sec) and lookahead:
+        return _absorb_lookahead(out, words, min_words, min_sec)
     if min_words or min_sec:
         src = list(out)
         i = 0
@@ -355,6 +361,50 @@ def smooth_labels(hyp: list, words: list, *, min_words: int = 0, min_sec: float 
                 for k in range(i, j + 1):
                     out[k] = out[i - 1]
             i = j + 1
+    return out
+
+
+def _absorb_lookahead(labels: list, words: list, min_words: int, min_sec: float) -> list:
+    """Короткие серии — но с оглядкой на следующую длинную.
+
+    Метка на стыке дрожит: «А… | Б Б | А | Б Б Б Б…». Без заглядывания
+    каждый короткий кусок уходит к предыдущему, и начало реплики Б целиком
+    достаётся А. Здесь группа коротких кусков между длинными А и Б делится
+    там, где впервые появился Б: всё с этого места — начало его реплики.
+    Если продолжения ещё нет (край живого черновика) — к предыдущему, как
+    раньше.
+    """
+    runs, i = [], 0
+    while i < len(labels):
+        j = i
+        while j + 1 < len(labels) and labels[j + 1] == labels[i]:
+            j += 1
+        runs.append((i, j, labels[i]))
+        i = j + 1
+
+    def short(run) -> bool:
+        a, b, _ = run
+        return (b - a + 1 < min_words) or (words[b][1] - words[a][0] < min_sec)
+
+    out = list(labels)
+    k, prev = 0, None
+    while k < len(runs):
+        if prev is None or not short(runs[k]):
+            prev = runs[k][2]
+            k += 1
+            continue
+        g = k
+        while g < len(runs) and short(runs[g]):
+            g += 1
+        nxt = runs[g][2] if g < len(runs) else None
+        split = g
+        if nxt is not None and nxt != prev:
+            split = next((m for m in range(k, g) if runs[m][2] == nxt), g)
+        for m in range(k, g):
+            label = prev if m < split else nxt
+            for t in range(runs[m][0], runs[m][1] + 1):
+                out[t] = label
+        k = g
     return out
 
 
@@ -404,8 +454,32 @@ def word_errors(sid: str, segments: list, smooth: dict | None = None) -> dict:
     rows, cols = linear_sum_assignment(-counts)
     correct = counts[rows, cols].sum()
     shares = counts.sum(axis=1) / max(1, len(words))
+    # Запаздывание смены говорящего: на каждой настоящей смене — сколько
+    # первых слов новой реплики (до пяти) досталось предыдущему говорящему
+    # и сколько последних слов прежней реплики ушло новому.
+    mapping = {hyp_labels[r]: ref_labels[c] for r, c in zip(rows, cols)}
+    mapped = [mapping.get(x) for x in hyp]
+    ref_seq = [w[2] for w in words]
+    changes = late = late_words = early = early_words = 0
+    for i in range(1, len(ref_seq)):
+        if ref_seq[i] == ref_seq[i - 1]:
+            continue
+        changes += 1
+        k = 0
+        while i + k < len(ref_seq) and k < 5 and ref_seq[i + k] == ref_seq[i] and mapped[i + k] == ref_seq[i - 1]:
+            k += 1
+        late += bool(k)
+        late_words += k
+        k = 0
+        while i - 1 - k >= 0 and k < 5 and ref_seq[i - 1 - k] == ref_seq[i - 1] and mapped[i - 1 - k] == ref_seq[i]:
+            k += 1
+        early += bool(k)
+        early_words += k
+
     hyp_runs = runs_of(hyp)
     return {
+        "changes": changes, "late": late, "late_words": late_words,
+        "early": early, "early_words": early_words,
         "err": 1 - correct / max(1, len(words)),
         "spk": int((shares >= 0.02).sum()),
         "ref_spk": len(ref_labels),
@@ -450,6 +524,8 @@ def evaluate(config: dict) -> dict:
     result["turns"] = sum(v["turns"] for v in trusted.values())
     result["ref_turns"] = sum(v["ref_turns"] for v in trusted.values())
     result["scraps"] = sum(v["scraps"] for v in trusted.values())
+    for key in ("changes", "late", "late_words", "early", "early_words"):
+        result[key] = sum(v.get(key, 0) for v in trusted.values())
     return result
 
 
@@ -512,6 +588,24 @@ def configs_for(stage: str, args) -> list[dict]:
             bases.append(dict(mode="sortformer", variant=variant, latency=lat, tau=0.0, rho=0.0, delta=0.0))
         return [dict(b, smooth=dict(live, **({"establish": n} if n else {})))
                 for b in bases for n in (0, 10, 20, 40)]
+    if stage == "boundary":
+        # Кто отдаёт начало новой реплики предыдущему говорящему: сама
+        # разметка или правила черновика поверх неё.
+        variants = [None, dict(min_words=4), dict(snap=1), dict(min_words=4, snap=1)]
+        configs = []
+        for variant, lat in (("stream0.32", 0.32), ("stream1.04", 1.04)):
+            sf = dict(mode="sortformer", variant=variant, latency=lat, tau=0.0, rho=0.0, delta=0.0)
+            configs += [dict(sf, smooth=v) for v in variants]
+        return configs
+    if stage == "lag":
+        live = dict(min_words=4, snap=1)
+        ahead = dict(min_words=4, snap=1, lookahead=True)
+        configs = []
+        for shift in (0.0, 0.08, 0.16, 0.24, 0.32, 0.4):
+            sf = dict(mode="sortformer", variant="stream0.32", latency=0.32,
+                      tau=0.0, rho=0.0, delta=0.0, shift=shift)
+            configs += [dict(sf, smooth=v) for v in (None, live, ahead)]
+        return configs
     if stage == "one":
         return [dict(mode=args.mode, latency=args.latency[0],
                      tau=args.tau, rho=args.rho, delta=args.delta)]
@@ -554,6 +648,16 @@ def run_eval(refs: dict, args) -> None:
         print(f"{label:10} {c['latency']:5.2f} {c['tau']:4.2f} {c['rho']:4.2f} {c['delta']:5.2f} {sm:>22} │ "
               f"{r['mean'] * 100:6.1f}% {r['worst'] * 100:5.1f}% {r['turns']:4d}/{r['ref_turns']:<4d} "
               f"{r['scraps']:8d} {r['der'] * 100:6.1f}% │ {cells}")
+    if args.stage in ("boundary", "lag"):
+        print()
+        print("смен говорящего на своих записях:", results[0]["changes"])
+        print(f"{'вариант':12} {'сдвиг':>5} {'правила':>32} │ {'начало ушло предыдущему':>24} {'конец ушёл новому':>18} │ {'ошибка':>6} {'DER AMI':>7}")
+        for r in sorted(results, key=lambda r: (r["config"].get("variant"), r["config"].get("shift", 0), str(r["config"].get("smooth")))):
+            c = r["config"]
+            sm = ",".join(f"{k}={v}" for k, v in (c.get("smooth") or {}).items()) or "—"
+            n = max(1, r["changes"])
+            print(f"{c.get('variant', c['mode']):12} {c.get('shift', 0):5.2f} {sm:>32} │ {r['late'] / n * 100:6.1f}% смен, {r['late_words']:4d} слов"
+                  f"   {r['early'] / n * 100:6.1f}% смен, {r['early_words']:4d} слов │ {r['mean'] * 100:5.1f}% {r['der'] * 100:6.1f}%")
     print("\nв ячейке: доля слов под чужим именем (для встреч AMI — DER), найдено говорящих / в эталоне;"
           " * — чистовик ненадёжен, в среднее не входит;\n"
           "реплик — в черновике / в чистовике, обрывков — реплик короче трёх слов (без *)")
