@@ -6,7 +6,8 @@
 подмены — баг должен воспроизвестись, иначе проверка ничего не ловит.
 Потом с подменой — слова целые, а говорящих по-прежнему двое.
 
-Заодно проверяет фильтр галлюцинаций в normalize().
+Заодно проверяет фильтр галлюцинаций в normalize() и то, что обрывок
+в пару слов не заводит нового говорящего.
 
 Запуск внутри контейнера worker-live:
 
@@ -80,7 +81,7 @@ def main() -> int:
             {"start": 2, "end": 4, "speaker": 2,
              "text": "Редактор субтитров А.Синецкая Корректор А.Егорова"},
             {"start": 4, "end": 6, "speaker": 2,
-             "text": "Подписывайтесь на канал."},
+             "text": "Подписывайтесь на наш канал, друзья."},
         ],
         "buffer_transcription": "Субтитры сделал DimaTorzok",
         "status": "active_transcription",
@@ -88,10 +89,40 @@ def main() -> int:
     normalized = engine.normalize(response)
     texts = [line["text"] for line in normalized["lines"]]
     print("фильтр галлюцинаций:", texts, "| буфер:", repr(normalized["buffer"]))
-    if texts != ["Девушки отдыхают...", "Подписывайтесь на канал."]:
+    if texts != ["Девушки отдыхают...", "Подписывайтесь на наш канал, друзья."]:
         failures.append(f"фильтр галлюцинаций: {texts}")
     if normalized["buffer"]:
         failures.append(f"галлюцинация осталась в буфере: {normalized['buffer']!r}")
+
+    # Обрывки на стыке реплик: так выглядел живой черновик на записи
+    # с двумя собеседниками — метка дрожала на каждом слове.
+    a, b = "SPEAKER_01", "SPEAKER_02"
+
+    def line(speaker, text, start):
+        return {"start": start, "end": start + 1, "speaker": speaker, "text": text}
+
+    absorb = engine._absorb_short_turns
+    got = absorb([
+        line(a, "Но их", 0), line(b, "нельзя", 1),
+        line(a, "заменить на слово, в котором есть «е».", 2),
+        line(b, "Вот и думаю, сейчас вот первое слово", 11),
+    ], 4)
+    print("обрывки:", [(l["speaker"], l["text"]) for l in got])
+    if [(l["speaker"], l["text"]) for l in got] != [
+        (a, "Но их нельзя заменить на слово, в котором есть «е»."),
+        (b, "Вот и думаю, сейчас вот первое слово"),
+    ]:
+        failures.append(f"обрывок не приклеился: {got}")
+    kept = absorb([line(a, "Длинная реплика первого участника", 0),
+                   line(b, "Нет, я так не думаю", 3), line(a, "Хорошо", 5)], 4)
+    # «Хорошо» — обрывок, он уходит к B; сама реплика B остаётся своей.
+    if [l["speaker"] for l in kept] != [a, b] or not kept[1]["text"].startswith("Нет, я так не думаю"):
+        failures.append(f"реплика из 4+ слов потеряла говорящего: {kept}")
+    paused = [line(a, "Первая часть мысли у меня", 0), line(a, "и вторая после паузы тоже", 4)]
+    if absorb(paused, 4) != paused:
+        failures.append("разрыв на паузе у одного говорящего склеился")
+    if absorb(got, 1) != got:
+        failures.append("min_words=1 должен выключать правило")
 
     for failure in failures:
         print("ПРОВАЛ:", failure)

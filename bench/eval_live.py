@@ -228,7 +228,48 @@ class _AudioStub:
         self.data = self._Data()
 
 
-def word_errors(sid: str, segments: list) -> dict:
+def smooth_labels(hyp: list, words: list, *, min_words: int = 0, min_sec: float = 0.0,
+                  gap: float = 0.0) -> list:
+    """Реплика вместо слова: короткий обрывок не может сменить говорящего.
+
+    Смотрит только назад, поэтому годится и для живого режима: обрывок
+    остаётся у предыдущего говорящего. gap — смена говорящего допустима
+    только на паузе не короче gap секунд.
+    """
+    out = list(hyp)
+    if gap > 0:
+        for i in range(1, len(out)):
+            if out[i] != out[i - 1] and words[i][0] - words[i - 1][1] < gap:
+                out[i] = out[i - 1]
+    if min_words or min_sec:
+        src = list(out)
+        i = 0
+        while i < len(src):
+            j = i
+            while j + 1 < len(src) and src[j + 1] == src[i]:
+                j += 1
+            span = words[j][1] - words[i][0]
+            if i > 0 and (j - i + 1 < min_words or span < min_sec):
+                for k in range(i, j + 1):
+                    out[k] = out[i - 1]
+            i = j + 1
+    return out
+
+
+def runs_of(labels: list) -> list[int]:
+    """Длины подряд идущих отрезков одного говорящего, в словах."""
+    runs, n = [], 0
+    for i, label in enumerate(labels):
+        if i and label != labels[i - 1]:
+            runs.append(n)
+            n = 0
+        n += 1
+    if n:
+        runs.append(n)
+    return runs
+
+
+def word_errors(sid: str, segments: list, smooth: dict | None = None) -> dict:
     """Раздаёт слова говорящим выравниванием WhisperLiveKit и сверяет с чистовиком."""
     from scipy.optimize import linear_sum_assignment
     from whisperlivekit.timed_objects import ASRToken, SpeakerSegment
@@ -250,6 +291,8 @@ def word_errors(sid: str, segments: list) -> dict:
             hyp.append(speaker)
     else:
         hyp = [1] * len(words)
+    if smooth:
+        hyp = smooth_labels(hyp, words, **smooth)
 
     ref_labels = sorted({w[2] for w in words})
     hyp_labels = sorted(set(hyp))
@@ -259,21 +302,31 @@ def word_errors(sid: str, segments: list) -> dict:
     rows, cols = linear_sum_assignment(-counts)
     correct = counts[rows, cols].sum()
     shares = counts.sum(axis=1) / max(1, len(words))
+    hyp_runs = runs_of(hyp)
     return {
         "err": 1 - correct / max(1, len(words)),
         "spk": int((shares >= 0.02).sum()),
         "ref_spk": len(ref_labels),
+        # Дробление — то, что видно глазу: сколько реплик в черновике
+        # против чистовика и сколько из них обрывки короче трёх слов.
+        "turns": len(hyp_runs),
+        "ref_turns": len(runs_of([w[2] for w in words])),
+        "scraps": sum(1 for n in hyp_runs if n < 3),
     }
 
 
 def evaluate(config: dict) -> dict:
     result = {"config": config, "files": {}}
+    params = {k: v for k, v in config.items() if k != "smooth"}
     for sid in _FILES:
-        segments = simulate(sid, **config)
-        result["files"][sid] = word_errors(sid, segments)
-    trusted = [v["err"] for k, v in result["files"].items() if k not in UNTRUSTED]
-    result["mean"] = float(np.mean(trusted))
-    result["worst"] = float(np.max(trusted))
+        segments = simulate(sid, **params)
+        result["files"][sid] = word_errors(sid, segments, config.get("smooth"))
+    trusted = {k: v for k, v in result["files"].items() if k not in UNTRUSTED}
+    result["mean"] = float(np.mean([v["err"] for v in trusted.values()]))
+    result["worst"] = float(np.max([v["err"] for v in trusted.values()]))
+    result["turns"] = sum(v["turns"] for v in trusted.values())
+    result["ref_turns"] = sum(v["ref_turns"] for v in trusted.values())
+    result["scraps"] = sum(v["scraps"] for v in trusted.values())
     return result
 
 
@@ -290,6 +343,17 @@ def configs_for(stage: str, args) -> list[dict]:
             for lat in args.latency
             for tau, rho, delta in itertools.product(args.taus, args.rhos, args.deltas)
         ]
+    if stage == "smooth":
+        best = dict(mode="fixed", tau=0.6, rho=0.1, delta=1.0)
+        variants = [None,
+                    dict(min_words=2), dict(min_words=3), dict(min_words=4), dict(min_words=6),
+                    dict(min_sec=0.5), dict(min_sec=1.0), dict(min_sec=1.5), dict(min_sec=2.0),
+                    dict(gap=0.1), dict(gap=0.2), dict(gap=0.3),
+                    dict(gap=0.2, min_words=3), dict(gap=0.2, min_sec=1.0)]
+        configs = [dict(mode="wlk", latency=0.5, **DEFAULTS)]
+        for lat in args.latency:
+            configs += [dict(best, latency=lat, smooth=v) for v in variants]
+        return configs
     if stage == "one":
         return [dict(mode=args.mode, latency=args.latency[0],
                      tau=args.tau, rho=args.rho, delta=args.delta)]
@@ -315,7 +379,8 @@ def run_eval(refs: dict, args) -> None:
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     results.sort(key=lambda r: r["mean"])
-    header = f"{'режим':9} {'задерж':>6} {'tau':>4} {'rho':>4} {'delta':>5} │ {'среднее':>7} {'худшее':>6} │ "
+    header = (f"{'режим':9} {'задерж':>6} {'tau':>4} {'rho':>4} {'delta':>5} {'сглаживание':>22} │ "
+              f"{'среднее':>7} {'худшее':>6} {'реплик':>9} {'обрывков':>8} │ ")
     header += " ".join(f"{short(s):>11}" for s in names)
     print(header)
     print("─" * len(header))
@@ -325,10 +390,13 @@ def run_eval(refs: dict, args) -> None:
             f"{r['files'][s]['err'] * 100:5.1f}% {r['files'][s]['spk']}/{r['files'][s]['ref_spk']}"
             for s in names
         )
-        print(f"{c['mode']:9} {c['latency']:6.1f} {c['tau']:4.2f} {c['rho']:4.2f} {c['delta']:5.2f} │ "
-              f"{r['mean'] * 100:6.1f}% {r['worst'] * 100:5.1f}% │ {cells}")
+        sm = ",".join(f"{k}={v}" for k, v in (c.get("smooth") or {}).items()) or "—"
+        print(f"{c['mode']:9} {c['latency']:6.1f} {c['tau']:4.2f} {c['rho']:4.2f} {c['delta']:5.2f} {sm:>22} │ "
+              f"{r['mean'] * 100:6.1f}% {r['worst'] * 100:5.1f}% {r['turns']:4d}/{r['ref_turns']:<4d} "
+              f"{r['scraps']:8d} │ {cells}")
     print("\nв ячейке: доля слов под чужим именем, найдено говорящих / в чистовике;"
-          " * — чистовик ненадёжен, в среднее не входит")
+          " * — чистовик ненадёжен, в среднее не входит;\n"
+          "реплик — в черновике / в чистовике, обрывков — реплик короче трёх слов (без *)")
 
 
 def main() -> None:

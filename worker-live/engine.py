@@ -602,6 +602,57 @@ def _drop_hallucinations(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text)
 
 
+def _absorb_short_turns(lines: list[dict[str, Any]], min_words: int) -> list[dict[str, Any]]:
+    """Обрывок короче min_words слов не может сменить говорящего.
+
+    diart решает «кто говорит» каждые полсекунды по звуку, и на стыке
+    реплик метка дрожит: «Но их» у одного, «нельзя» у другого, дальше
+    снова первый. Коммерческие системы (AssemblyAI) решают по реплике
+    целиком, а обрывку короче секунды своего говорящего не дают. Здесь
+    так же: подряд идущие реплики одного говорящего — одна серия, и если
+    в серии меньше min_words слов, она остаётся у предыдущего говорящего
+    и приклеивается к его реплике.
+
+    Смотрим только назад, поэтому годится для живого режима: пока новый
+    человек сказал меньше min_words слов, они идут под предыдущим, а
+    когда реплика выросла — становятся отдельной. Замер (bench/eval_live.py,
+    семь записей): обрывков короче трёх слов 2 вместо 140, слов под чужим
+    именем 16,3% вместо 18,1%. Цена — настоящий ответ в пару слов («Да,
+    конечно») попадает к собеседнику.
+    """
+    if min_words <= 1 or len(lines) < 2:
+        return lines
+
+    series: list[list[dict[str, Any]]] = []
+    for line in lines:
+        if series and series[-1][0]["speaker"] == line["speaker"]:
+            series[-1].append(line)
+        else:
+            series.append([line])
+
+    out: list[dict[str, Any]] = []
+    glued = False  # к последней реплике только что приклеен чужой обрывок
+    for run in series:
+        words = sum(len(line["text"].split()) for line in run)
+        if out and words < min_words:
+            for line in run:
+                _glue(out[-1], line)
+            glued = True
+            continue
+        run = [dict(line) for line in run]
+        if glued and out[-1]["speaker"] == run[0]["speaker"]:
+            # «А, обрывок Б, снова А» — это одна реплика А.
+            _glue(out[-1], run.pop(0))
+        out.extend(run)
+        glued = False
+    return out
+
+
+def _glue(target: dict[str, Any], line: dict[str, Any]) -> None:
+    target["text"] = f"{target['text']} {line['text']}"
+    target["end"] = max(target["end"], line["end"])
+
+
 def normalize(response: Any) -> dict[str, Any]:
     """Приводит ответ движка к формату, который понимает наш фронтенд."""
     raw_lines = _get(response, "lines") or []
@@ -620,7 +671,7 @@ def normalize(response: Any) -> dict[str, Any]:
         )
 
     return {
-        "lines": lines,
+        "lines": _absorb_short_turns(lines, settings.live_min_turn_words),
         # Гипотеза, которую движок ещё может переписать. Показываем её
         # серым: честнее, чем выдавать неустоявшийся текст за готовый.
         "buffer": _drop_hallucinations(_get(response, "buffer_transcription") or "").strip(),
